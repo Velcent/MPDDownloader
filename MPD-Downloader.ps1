@@ -60,28 +60,6 @@ function Get-VideoIdFromEmbedUrl {
     return $null
 }
 
-function Get-OutputIdFromVideoId {
-    param([string]$VideoId)
-
-    return $VideoId -replace '^V_', ''
-}
-
-function Move-LegacyOutputFile {
-    param(
-        [string]$LegacyPath,
-        [string]$NewPath
-    )
-
-    if ($LegacyPath -eq $NewPath) {
-        return
-    }
-
-    if ((Test-Path -LiteralPath $LegacyPath) -and -not (Test-Path -LiteralPath $NewPath)) {
-        Move-Item -LiteralPath $LegacyPath -Destination $NewPath
-        Write-Host "Renamed legacy file: $(Split-Path -Leaf $LegacyPath) -> $(Split-Path -Leaf $NewPath)"
-    }
-}
-
 function Get-EmbedUrlsFromMhtml {
     param([string]$MhtmlText)
 
@@ -141,8 +119,7 @@ function Save-RemoteEmbedHtml {
 function Get-LocalEmbedHtml {
     param([string]$VideoId)
 
-    $outputId = Get-OutputIdFromVideoId $VideoId
-    $expectedFile = Join-Path $HtmlDir "$outputId.html"
+    $expectedFile = Join-Path $HtmlDir "$VideoId.html"
     if (Test-Path -LiteralPath $expectedFile) {
         Write-Host "Using local embed HTML: $expectedFile"
         return Get-Content -LiteralPath $expectedFile -Raw
@@ -612,20 +589,15 @@ foreach ($mhtmlFile in $mhtmlFiles) {
             continue
         }
 
-        $outputId = Get-OutputIdFromVideoId $videoId
-        $mpdPath = Join-Path $MpdDir "$outputId.mpd"
-        $mp4Path = Join-Path $Mp4Dir "$outputId.mp4"
-        $htmlPath = Join-Path $HtmlDir "$outputId.html"
-
-        Move-LegacyOutputFile -LegacyPath (Join-Path $MpdDir "$videoId.mpd") -NewPath $mpdPath
-        Move-LegacyOutputFile -LegacyPath (Join-Path $Mp4Dir "$videoId.mp4") -NewPath $mp4Path
-        Move-LegacyOutputFile -LegacyPath (Join-Path $HtmlDir "$videoId.html") -NewPath $htmlPath
+        $mpdPath = Join-Path $MpdDir "$videoId.mpd"
+        $mp4Path = Join-Path $Mp4Dir "$videoId.mp4"
+        $htmlPath = Join-Path $HtmlDir "$videoId.html"
 
         Write-Host ""
-        Write-Host "Video: $videoId -> $outputId"
+        Write-Host "Video: $videoId"
 
         if (Test-Path -LiteralPath $mpdPath) {
-            Write-Host "Skipping MPD: $outputId.mpd already exists"
+            Write-Host "Skipping MPD: $videoId.mpd already exists"
         }
         else {
             $embeddedHtml = Get-MhtmlPartText -MhtmlText $mhtmlText -ContentLocation $embedUrl
@@ -646,7 +618,7 @@ foreach ($mhtmlFile in $mhtmlFiles) {
                 Write-Warning "No qsep videoUrl found for $videoId. Try again after the embed page is fully loaded in the browser."
             }
             else {
-                Write-Host "Saving MPD: $outputId.mpd"
+                Write-Host "Saving MPD: $videoId.mpd"
                 [void](Save-MpdFromQsepUrl -QsepUrl $qsepUrl -MpdPath $mpdPath)
             }
         }
@@ -655,7 +627,7 @@ foreach ($mhtmlFile in $mhtmlFiles) {
             Download-Mp4 -MpdPath $mpdPath -Mp4Path $mp4Path
         }
         else {
-            Write-Warning "MP4 skipped because $outputId.mpd does not exist."
+            Write-Warning "MP4 skipped because $videoId.mpd does not exist."
         }
 
         Close-OpenEmbedTabs
