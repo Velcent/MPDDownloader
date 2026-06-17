@@ -1,13 +1,15 @@
 param(
     [string]$Root = $PSScriptRoot,
     [switch]$NoBrowser,
-    [int]$BrowserPollSeconds = 2
+    [int]$BrowserPollSeconds = 2,
+    [int]$ParallelDownloads = 10
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $Root = (Resolve-Path -LiteralPath $Root).Path
+$ParallelDownloads = [Math]::Max(1, $ParallelDownloads)
 $HtmlDir = Join-Path $Root 'html'
 $MpdDir = Join-Path $Root 'mpd'
 $Mp4Dir = Join-Path $Root 'mp4'
@@ -582,32 +584,105 @@ function Add-MpdListEntry {
     Add-Content -LiteralPath $ListPath -Value $line -Encoding UTF8
 }
 
-function Download-Mp4 {
+function Start-DownloadJob {
     param(
+        [string]$YtDlpPath,
         [string]$MpdPath,
         [string]$Mp4Path
     )
 
-    if (Test-Path -LiteralPath $Mp4Path) {
-        Write-Host "Skipping MP4: $(Split-Path -Leaf $Mp4Path) already exists"
+    Start-Job -ArgumentList $YtDlpPath, $MpdPath, $Mp4Path -ScriptBlock {
+        param(
+            [string]$YtDlpPath,
+            [string]$MpdPath,
+            [string]$Mp4Path
+        )
+
+        $outputTemplate = Join-Path (Split-Path -Parent $Mp4Path) "$([System.IO.Path]::GetFileNameWithoutExtension($Mp4Path)).%(ext)s"
+        $mpdUrl = ([System.Uri](Resolve-Path -LiteralPath $MpdPath).Path).AbsoluteUri
+
+        & $YtDlpPath --enable-file-urls $mpdUrl -f 'bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate
+        if ($LASTEXITCODE -ne 0) {
+            throw "yt-dlp failed with exit code $LASTEXITCODE for $Mp4Path"
+        }
+    }
+}
+
+function Invoke-ParallelDownloads {
+    param(
+        [object[]]$Tasks,
+        [int]$MaxParallel
+    )
+
+    if (-not $Tasks -or $Tasks.Count -eq 0) {
         return
     }
 
     $ytDlp = Get-Command yt-dlp -ErrorAction SilentlyContinue
     if (-not $ytDlp) {
-        Write-Warning 'yt-dlp was not found in PATH. MP4 download skipped.'
+        Write-Warning 'yt-dlp was not found in PATH. MP4 downloads skipped.'
         return
     }
 
-    $outputTemplate = Join-Path (Split-Path -Parent $Mp4Path) "$([System.IO.Path]::GetFileNameWithoutExtension($Mp4Path)).%(ext)s"
-    $mpdUrl = Get-FileUrl $MpdPath
+    Write-Host ""
+    Write-Host "Downloading MP4 files max 720p with $MaxParallel parallel job(s)..."
 
-    Write-Host "Downloading MP4 max 720p: $(Split-Path -Leaf $Mp4Path)"
-    & $ytDlp.Source --enable-file-urls $mpdUrl -f 'bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate
+    $running = @()
+    $nextIndex = 0
+
+    while ($nextIndex -lt $Tasks.Count -or $running.Count -gt 0) {
+        while ($running.Count -lt $MaxParallel -and $nextIndex -lt $Tasks.Count) {
+            $task = $Tasks[$nextIndex]
+            $nextIndex++
+
+            if (Test-Path -LiteralPath $task.Mp4Path) {
+                Write-Host "Skipping MP4: $(Split-Path -Leaf $task.Mp4Path) already exists"
+                continue
+            }
+
+            if (-not (Test-Path -LiteralPath $task.MpdPath)) {
+                Write-Warning "MP4 skipped because $(Split-Path -Leaf $task.MpdPath) does not exist."
+                continue
+            }
+
+            Write-Host "Starting MP4: $(Split-Path -Leaf $task.Mp4Path)"
+            $job = Start-DownloadJob -YtDlpPath $ytDlp.Source -MpdPath $task.MpdPath -Mp4Path $task.Mp4Path
+            $running += [pscustomobject]@{
+                Job = $job
+                Task = $task
+            }
+        }
+
+        if ($running.Count -eq 0) {
+            continue
+        }
+
+        $completedJob = Wait-Job -Job ($running.Job) -Any
+        $completedTask = ($running | Where-Object { $_.Job.Id -eq $completedJob.Id } | Select-Object -First 1).Task
+        try {
+            Receive-Job -Job $completedJob -ErrorAction Stop
+        }
+        catch {
+            Write-Warning $_.Exception.Message
+        }
+
+        if ($completedJob.State -eq 'Failed') {
+            Write-Warning "Download failed: $(Split-Path -Leaf $completedTask.Mp4Path)"
+        }
+        else {
+            Write-Host "Finished MP4: $(Split-Path -Leaf $completedTask.Mp4Path)"
+        }
+
+        Remove-Job -Job $completedJob
+        $running = @($running | Where-Object { $_.Job.Id -ne $completedJob.Id })
+    }
 }
 
 $listHeader = "mhtml_file`tembed_html`tvideo_size"
 Set-Content -LiteralPath $ListPath -Value $listHeader -Encoding UTF8
+$downloadTasks = @()
+$listEntries = @()
+$queuedMp4Paths = @{}
 
 $excludedScanDirs = @($HtmlDir, $MpdDir, $Mp4Dir) | ForEach-Object {
     (Resolve-Path -LiteralPath $_).Path.TrimEnd('\') + '\'
@@ -673,17 +748,34 @@ foreach ($mhtmlFile in $mhtmlFiles) {
             }
         }
 
-        if (Test-Path -LiteralPath $mpdPath) {
-            Download-Mp4 -MpdPath $mpdPath -Mp4Path $mp4Path
-        }
-        else {
+        if (-not (Test-Path -LiteralPath $mpdPath)) {
             Write-Warning "MP4 skipped because $videoId.mpd does not exist."
         }
+        else {
+            $mp4Key = $mp4Path.ToLowerInvariant()
+            if (-not $queuedMp4Paths.ContainsKey($mp4Key)) {
+                $queuedMp4Paths[$mp4Key] = $true
+                $downloadTasks += [pscustomobject]@{
+                    MpdPath = $mpdPath
+                    Mp4Path = $mp4Path
+                }
+            }
+        }
 
-        Add-MpdListEntry -MhtmlPath $mhtmlFile.FullName -EmbedUrl $embedUrl -Mp4Path $mp4Path
+        $listEntries += [pscustomobject]@{
+            MhtmlPath = $mhtmlFile.FullName
+            EmbedUrl = $embedUrl
+            Mp4Path = $mp4Path
+        }
 
         Close-OpenEmbedTabs
     }
+}
+
+Invoke-ParallelDownloads -Tasks $downloadTasks -MaxParallel $ParallelDownloads
+
+foreach ($entry in $listEntries) {
+    Add-MpdListEntry -MhtmlPath $entry.MhtmlPath -EmbedUrl $entry.EmbedUrl -Mp4Path $entry.Mp4Path
 }
 
 Write-Host ""
