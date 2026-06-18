@@ -412,7 +412,20 @@ function Test-IframeAllowed {
 
     try {
         $uri = [Uri]$FrameUrl
-        return ($uri.Scheme -in @('http', 'https') -and $uri.Host.Equals('dev.epicgames.com', [System.StringComparison]::OrdinalIgnoreCase))
+        if ($uri.Scheme -notin @('http', 'https')) {
+            return $false
+        }
+
+        if (-not $uri.Host.Equals('dev.epicgames.com', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+
+        $path = $uri.AbsolutePath.ToLowerInvariant()
+        if ($path -match '^/(id|login|account|community/api/user_identity/login)') {
+            return $false
+        }
+
+        return $true
     }
     catch {
         return $false
@@ -458,6 +471,30 @@ function Test-LooksLikePageUrl {
     }
 
     return $extension -in @('.html', '.htm', '.php', '.aspx')
+}
+
+function Test-ResourceAllowed {
+    param([string]$ResourceUrl)
+
+    try {
+        $uri = [Uri]$ResourceUrl
+        if ($uri.Scheme -notin @('http', 'https')) {
+            return $false
+        }
+    }
+    catch {
+        return $false
+    }
+
+    if (Test-UrlInScope $ResourceUrl) {
+        return $true
+    }
+
+    if (Test-LooksLikePageUrl $ResourceUrl) {
+        return $false
+    }
+
+    return $true
 }
 
 function Resolve-RedirectUrl {
@@ -853,13 +890,7 @@ function Add-ResourceTask {
         return
     }
 
-    try {
-        $uri = [Uri]$ResourceUrl
-        if ($uri.Scheme -notin @('http', 'https')) {
-            return
-        }
-    }
-    catch {
+    if (-not (Test-ResourceAllowed $ResourceUrl)) {
         return
     }
 
@@ -1103,6 +1134,15 @@ function Add-PageTask {
     )
 
     $TaskUrl = Get-PreferredPageUrl $TaskUrl
+    if ($Kind -eq 'iframe') {
+        if (-not (Test-IframeAllowed $TaskUrl)) {
+            return $false
+        }
+    }
+    elseif (-not (Test-UrlInScope $TaskUrl)) {
+        return $false
+    }
+
     $canonicalKey = Get-PageCanonicalKey $TaskUrl
     $version = Get-ApplicationVersion $TaskUrl
 
@@ -1161,6 +1201,17 @@ while ($pageQueue.Count -gt 0) {
     try {
         $pageResult = Get-PageFromBrowser -PageUrl $task.Url
         $finalUrl = $pageResult.FinalUrl
+        if ($task.Kind -eq 'iframe') {
+            if (-not (Test-IframeAllowed $finalUrl)) {
+                Write-Warning "Skipped iframe outside allowed domain/path: $finalUrl"
+                continue
+            }
+        }
+        elseif (-not (Test-UrlInScope $finalUrl)) {
+            Write-Warning "Skipped page outside scope after redirect: $finalUrl"
+            continue
+        }
+
         Mark-PageSeen -Seen $seenPages -Urls @($task.Url, $task.OriginalUrl, $finalUrl)
         $html = $pageResult.Html
         $items = @($pageResult.Items) + @(Get-AttributeLinks -Html $html -BaseUrl $finalUrl)
