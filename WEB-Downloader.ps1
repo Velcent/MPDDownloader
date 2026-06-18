@@ -931,6 +931,11 @@ function Process-ResourceQueue {
         $resourceResult = Save-BrowserResponseBody -ResourceUrl $task.Url -LocalPath $task.LocalPath
 
         if (-not $resourceResult.Success) {
+            if (Test-Path -LiteralPath $task.LocalPath) {
+                Write-Host "File exists after warning, treating as downloaded: $($task.Url)"
+                continue
+            }
+
             if (Test-NotFoundError $resourceResult.Error) {
                 Write-Warning "File not found, skipped: $($resourceResult.Url) - $($resourceResult.Error)"
                 continue
