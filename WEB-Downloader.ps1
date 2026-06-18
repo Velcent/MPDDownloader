@@ -1,6 +1,6 @@
 param(
     [string]$Url = 'https://dev.epicgames.com/documentation/metahuman',
-    [string]$ScopeUrl = 'https://dev.epicgames.com/documentation/metahuman',
+    [string]$ScopeUrl = '',
     [string]$Root = $PSScriptRoot,
     [int]$BrowserPollSeconds = 1,
     [int]$ParallelDownloads = 1,
@@ -389,6 +389,44 @@ function Get-NormalizedScope {
 
 $NormalizedScope = Get-NormalizedScope $ScopeUrl
 
+function Test-WebPageOutsideScope {
+    param([string]$CandidateUrl)
+    return ((Test-LooksLikePageUrl $CandidateUrl) -and (Test-HostUrlInScope $CandidateUrl))
+}
+function Test-HostUrlInScope {
+    param([string]$CandidateUrl)
+
+    try {
+        $scope = [Uri]$NormalizedScope
+        $url   = [Uri]$CandidateUrl
+    }
+    catch {
+        return $false
+    }
+
+    # Scheme harus sama
+    if ($scope.Scheme -ne $url.Scheme) {
+        return $false
+    }
+
+    # Host harus sama
+    if ($scope.Host -ne $url.Host) {
+        return $false
+    }
+
+    # Port harus sama
+    if ($scope.Port -ne $url.Port) {
+        return $false
+    }
+
+    $scopePath = $scope.AbsolutePath.TrimEnd('/')
+    $urlPath   = $url.AbsolutePath.TrimEnd('/')
+
+    return (
+        $urlPath -eq $scopePath -or
+        $urlPath.StartsWith("$scopePath/")
+    )
+}
 function Test-UrlInScope {
     param([string]$CandidateUrl)
 
@@ -398,7 +436,6 @@ function Test-UrlInScope {
     catch {
         return $false
     }
-
     return (
         $absolute.Equals($NormalizedScope, [System.StringComparison]::OrdinalIgnoreCase) -or
         $absolute.StartsWith("$NormalizedScope/", [System.StringComparison]::OrdinalIgnoreCase) -or
@@ -1159,6 +1196,10 @@ while ($pageQueue.Count -gt 0) {
 
     $pageResult = $null
     try {
+        if (-not (Test-WebPageOutsideScope $task.Url)) {
+            Write-Warning "Skipped page outside scope after redirect: $task.Url"
+            continue
+        }
         $pageResult = Get-PageFromBrowser -PageUrl $task.Url
         $finalUrl = $pageResult.FinalUrl
         Mark-PageSeen -Seen $seenPages -Urls @($task.Url, $task.OriginalUrl, $finalUrl)
@@ -1256,3 +1297,4 @@ Process-ResourceQueue -Queue $resourceQueue -Seen $seenResources
 
 Write-Host ""
 Write-Host "Done. Web pages listed in: $ListPath"
+pause
