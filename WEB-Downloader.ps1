@@ -2,12 +2,14 @@ param(
     [string]$Url = 'https://dev.epicgames.com/documentation/metahuman',
     [string]$ScopeUrl = 'https://dev.epicgames.com/documentation/metahuman',
     [string]$Root = $PSScriptRoot,
-    [int]$BrowserPollSeconds = .5,
-    [int]$ParallelDownloads = 10,
+    [int]$BrowserPollSeconds = 1,
+    [int]$ParallelDownloads = 1,
     [int]$MaxPages = 0,
     [int]$MinPageWaitSeconds = 0,
     [int]$PageIdleSeconds = 2,
-    [int]$PageLoadTimeoutSeconds = 120
+    [int]$PageLoadTimeoutSeconds = 120,
+    [int]$ResourceLoadTimeoutSeconds = 30,
+    [int]$ResourceRetrySeconds = 2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +25,8 @@ $BrowserPollSeconds = [Math]::Max(1, $BrowserPollSeconds)
 $MinPageWaitSeconds = [Math]::Max(0, $MinPageWaitSeconds)
 $PageIdleSeconds = [Math]::Max(0, $PageIdleSeconds)
 $PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
+$ResourceLoadTimeoutSeconds = [Math]::Max(1, $ResourceLoadTimeoutSeconds)
+$ResourceRetrySeconds = [Math]::Max(0, $ResourceRetrySeconds)
 
 $WebDir = Join-Path $Root 'web'
 $PagesDir = Join-Path $WebDir 'pages'
@@ -164,6 +168,7 @@ function Receive-WebSocketText {
     do {
         $segment = [ArraySegment[byte]]::new($buffer)
         $result = $Socket.ReceiveAsync($segment, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+
         if ($result.Count -gt 0) {
             $stream.Write($buffer, 0, $result.Count)
         }
@@ -726,6 +731,16 @@ function Add-ResourceTask {
     })
 }
 
+function Test-NotFoundError {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        return $false
+    }
+
+    return $Message -match '(?i)(404|not\s*found|ERR_HTTP_RESPONSE_CODE_FAILURE)'
+}
+
 function Save-BrowserResponseBody {
     param(
         [string]$ResourceUrl,
@@ -736,6 +751,7 @@ function Save-BrowserResponseBody {
     $page = Open-DevToolsUrl 'about:blank'
     $socket = [System.Net.WebSockets.ClientWebSocket]::new()
     $requestId = $null
+    $statusCode = $null
     $commandId = 1
 
     try {
@@ -756,7 +772,7 @@ function Save-BrowserResponseBody {
         [void](Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Page.navigate' -Params @{ url = $ResourceUrl })
         $commandId++
 
-        $deadline = (Get-Date).AddMinutes(3)
+        $deadline = (Get-Date).AddSeconds($ResourceLoadTimeoutSeconds)
         while ((Get-Date) -lt $deadline) {
             $messageText = Receive-WebSocketText $socket
             $message = $messageText | ConvertFrom-Json
@@ -768,6 +784,7 @@ function Save-BrowserResponseBody {
                     $message.params.type -in @('Document', 'Image', 'Stylesheet', 'Script', 'Font', 'Media', 'Other', 'XHR', 'Fetch')
                 )) {
                     $requestId = [string]$message.params.requestId
+                    $statusCode = [int]$message.params.response.status
                 }
             }
 
@@ -778,6 +795,10 @@ function Save-BrowserResponseBody {
 
         if (-not $requestId) {
             throw "No browser response captured for $ResourceUrl"
+        }
+
+        if ($statusCode -eq 404) {
+            throw "404 Not Found"
         }
 
         $bodyResponse = Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Network.getResponseBody' -Params @{
@@ -834,7 +855,17 @@ function Process-ResourceQueue {
         $resourceResult = Save-BrowserResponseBody -ResourceUrl $task.Url -LocalPath $task.LocalPath
 
         if (-not $resourceResult.Success) {
-            Write-Warning "File download failed: $($resourceResult.Url) - $($resourceResult.Error)"
+            if (Test-NotFoundError $resourceResult.Error) {
+                Write-Warning "File not found, skipped: $($resourceResult.Url) - $($resourceResult.Error)"
+                continue
+            }
+
+            Write-Warning "File download failed, retrying: $($resourceResult.Url) - $($resourceResult.Error)"
+            if ($ResourceRetrySeconds -gt 0) {
+                Start-Sleep -Seconds $ResourceRetrySeconds
+            }
+
+            [void]$Queue.Add($task)
             continue
         }
 
@@ -1011,6 +1042,11 @@ while ($pageQueue.Count -gt 0) {
         }
 
         Write-Host "Saved $($task.Kind): $finalUrl"
+        if ($pageResult) {
+            Close-DevToolsPage -TargetId $pageResult.TargetId
+            $pageResult = $null
+        }
+
         Process-ResourceQueue -Queue $resourceQueue -Seen $seenResources
     }
     catch {
