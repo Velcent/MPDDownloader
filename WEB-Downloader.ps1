@@ -519,38 +519,85 @@ function Add-ResourceTask {
     })
 }
 
-function Start-ResourceJob {
+function Save-BrowserResponseBody {
     param(
         [string]$ResourceUrl,
         [string]$LocalPath
     )
 
-    Start-Job -ArgumentList $ResourceUrl, $LocalPath -ScriptBlock {
-        param([string]$ResourceUrl, [string]$LocalPath)
+    Ensure-Browser
+    $page = Open-DevToolsUrl 'about:blank'
+    $socket = [System.Net.WebSockets.ClientWebSocket]::new()
+    $requestId = $null
+    $commandId = 1
 
-        $result = [ordered]@{
+    try {
+        [void]$socket.ConnectAsync([Uri]$page.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+
+        [void](Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Network.enable')
+        $commandId++
+        [void](Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Page.enable')
+        $commandId++
+        [void](Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Page.navigate' -Params @{ url = $ResourceUrl })
+        $commandId++
+
+        $deadline = (Get-Date).AddMinutes(3)
+        while ((Get-Date) -lt $deadline) {
+            $messageText = Receive-WebSocketText $socket
+            $message = $messageText | ConvertFrom-Json
+
+            if ($message.method -eq 'Network.responseReceived') {
+                $responseUrl = [string]$message.params.response.url
+                if (-not $requestId -and $responseUrl -and (
+                    $responseUrl.Equals($ResourceUrl, [System.StringComparison]::OrdinalIgnoreCase) -or
+                    $message.params.type -in @('Document', 'Image', 'Stylesheet', 'Script', 'Font', 'Media', 'Other', 'XHR', 'Fetch')
+                )) {
+                    $requestId = [string]$message.params.requestId
+                }
+            }
+
+            if ($message.method -eq 'Network.loadingFinished' -and $requestId -and $message.params.requestId -eq $requestId) {
+                break
+            }
+        }
+
+        if (-not $requestId) {
+            throw "No browser response captured for $ResourceUrl"
+        }
+
+        $bodyResponse = Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Network.getResponseBody' -Params @{
+            requestId = $requestId
+        }
+
+        $parent = Split-Path -Parent $LocalPath
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+
+        if ($bodyResponse.result.base64Encoded) {
+            $bytes = [Convert]::FromBase64String([string]$bodyResponse.result.body)
+            [System.IO.File]::WriteAllBytes($LocalPath, $bytes)
+        }
+        else {
+            [System.IO.File]::WriteAllText($LocalPath, [string]$bodyResponse.result.body, [System.Text.UTF8Encoding]::new($false))
+        }
+
+        return [pscustomobject]@{
+            Url = $ResourceUrl
+            LocalPath = $LocalPath
+            Success = $true
+            Error = ''
+        }
+    }
+    catch {
+        return [pscustomobject]@{
             Url = $ResourceUrl
             LocalPath = $LocalPath
             Success = $false
-            Error = ''
+            Error = $_.Exception.Message
         }
-
-        try {
-            $parent = Split-Path -Parent $LocalPath
-            New-Item -ItemType Directory -Force -Path $parent | Out-Null
-
-            $headers = @{
-                'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari'
-            }
-
-            Invoke-WebRequest -Uri $ResourceUrl -UseBasicParsing -Headers $headers -OutFile $LocalPath -ErrorAction Stop
-            $result.Success = $true
-        }
-        catch {
-            $result.Error = $_.Exception.Message
-        }
-
-        [pscustomobject]$result
+    }
+    finally {
+        $socket.Dispose()
+        Close-DevToolsPage -TargetId $page.id
     }
 }
 
@@ -560,33 +607,16 @@ function Process-ResourceQueue {
         [hashtable]$Seen
     )
 
-    $running = @()
+    while ($Queue.Count -gt 0) {
+        $task = $Queue[0]
+        $Queue.RemoveAt(0)
 
-    while ($Queue.Count -gt 0 -or $running.Count -gt 0) {
-        while ($Queue.Count -gt 0 -and $running.Count -lt $ParallelDownloads) {
-            $task = $Queue[0]
-            $Queue.RemoveAt(0)
-
-            if (Test-Path -LiteralPath $task.LocalPath) {
-                continue
-            }
-
-            Write-Host "Downloading file: $($task.Url)"
-            $job = Start-ResourceJob -ResourceUrl $task.Url -LocalPath $task.LocalPath
-            $running += [pscustomobject]@{
-                Job = $job
-                Task = $task
-            }
-        }
-
-        if ($running.Count -eq 0) {
+        if (Test-Path -LiteralPath $task.LocalPath) {
             continue
         }
 
-        $completedJob = Wait-Job -Job ($running.Job) -Any
-        $resourceResult = Receive-Job -Job $completedJob
-        Remove-Job -Job $completedJob
-        $running = @($running | Where-Object { $_.Job.Id -ne $completedJob.Id })
+        Write-Host "Opening file in browser: $($task.Url)"
+        $resourceResult = Save-BrowserResponseBody -ResourceUrl $task.Url -LocalPath $task.LocalPath
 
         if (-not $resourceResult.Success) {
             Write-Warning "File download failed: $($resourceResult.Url) - $($resourceResult.Error)"
