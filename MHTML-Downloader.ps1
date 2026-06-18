@@ -2,9 +2,9 @@ param(
     [string]$Url = 'https://dev.epicgames.com/documentation/unreal-engine/BlueprintAPI',
     [string]$OutputRoot = (Join-Path $PSScriptRoot 'mhtml\BlueprintAPI'),
     [int]$BrowserPollSeconds = 1,
-    [int]$PageIdleSeconds = 2,
+    [int]$PageIdleSeconds = 0,
     [int]$PageLoadTimeoutSeconds = 120,
-    [int]$MaxLoadAttempts = 3,
+    [int]$MaxLoadAttempts = 10,
     [int]$MaxPages = 0,
     [switch]$Overwrite
 )
