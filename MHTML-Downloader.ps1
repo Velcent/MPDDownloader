@@ -1,6 +1,6 @@
 param(
     [string]$Url = 'https://dev.epicgames.com/documentation/unreal-engine/BlueprintAPI',
-    [string]$OutputRoot = (Join-Path $PSScriptRoot 'BlueprintAPI'),
+    [string]$OutputRoot = (Join-Path $PSScriptRoot 'mhtml\BlueprintAPI'),
     [int]$BrowserPollSeconds = 1,
     [int]$PageIdleSeconds = 2,
     [int]$PageLoadTimeoutSeconds = 120,
@@ -17,13 +17,14 @@ $PageIdleSeconds = [Math]::Max(0, $PageIdleSeconds)
 $PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
 
+$MhtmlRoot = Join-Path $PSScriptRoot 'mhtml'
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
-$ListPath = Join-Path $PSScriptRoot 'mhtml-list.tsv'
+$ListPath = Join-Path $MhtmlRoot 'mhtml-list.tsv'
 $script:BrowserPort = $null
-$script:BrowserProfileDir = Join-Path $PSScriptRoot '.edge-profile'
+$script:BrowserProfileDir = Join-Path $MhtmlRoot '.edge-profile'
 $script:CdpCommandId = 0
 
-New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $MhtmlRoot, $OutputRoot | Out-Null
 Set-Content -LiteralPath $ListPath -Value "url`tfinal_url`tfile`ttitle`tchild_count`tparent_url" -Encoding UTF8
 
 function Get-EdgePath {
@@ -84,7 +85,7 @@ function Ensure-Edge {
 
     foreach ($profileDir in @(
         $script:BrowserProfileDir,
-        (Join-Path $PSScriptRoot ".edge-profile-$PID-$(Get-Date -Format 'yyyyMMddHHmmss')")
+        (Join-Path $MhtmlRoot ".edge-profile-$PID-$(Get-Date -Format 'yyyyMMddHHmmss')")
     )) {
         $script:BrowserPort = Get-FreeTcpPort
         New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
