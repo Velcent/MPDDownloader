@@ -1,6 +1,5 @@
 param(
     [string]$Root = $PSScriptRoot,
-    [switch]$NoBrowser,
     [int]$BrowserPollSeconds = 2,
     [int]$ParallelDownloads = 10
 )
@@ -97,26 +96,6 @@ function Get-RemoteText {
         Write-Warning "Cannot fetch $Url. $($_.Exception.Message)"
         return $null
     }
-}
-
-function Save-RemoteEmbedHtml {
-    param(
-        [string]$Url,
-        [string]$HtmlPath
-    )
-
-    $html = Get-RemoteText $Url
-    if ([string]::IsNullOrWhiteSpace($html)) {
-        return $null
-    }
-
-    if (-not (Get-QsepUrl @($html))) {
-        return $html
-    }
-
-    [System.IO.File]::WriteAllText($HtmlPath, $html, [System.Text.UTF8Encoding]::new($false))
-    Write-Host "Saved embed HTML: $(Split-Path -Leaf $HtmlPath)"
-    return $html
 }
 
 function Get-LocalEmbedHtml {
@@ -730,11 +709,6 @@ foreach ($mhtmlFile in $mhtmlFiles) {
             $qsepUrl = Get-QsepUrl @($embeddedHtml, $localHtml)
 
             if (-not $qsepUrl) {
-                $remoteHtml = Save-RemoteEmbedHtml -Url $embedUrl -HtmlPath $htmlPath
-                $qsepUrl = Get-QsepUrl @($remoteHtml)
-            }
-
-            if (-not $qsepUrl -and -not $NoBrowser) {
                 $browserHtml = Save-EmbedHtmlFromBrowser -Url $embedUrl -HtmlPath $htmlPath
                 $qsepUrl = Get-QsepUrl @($browserHtml)
             }
