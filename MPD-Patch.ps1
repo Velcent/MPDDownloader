@@ -1,7 +1,6 @@
 param(
     [string]$Root = $PSScriptRoot,
-    [string]$ListFile = 'mpd-list.txt',
-    [switch]$NoBackup
+    [string]$ListFile = 'mpd-list.txt'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,10 +43,73 @@ function ConvertTo-QuotedPrintableHtml {
     return $Html -replace '=', '=3D'
 }
 
+function ConvertFrom-QuotedPrintableText {
+    param([string]$Text)
+
+    $withoutSoftBreaks = [regex]::Replace($Text, "=\r?\n", '')
+    return [regex]::Replace($withoutSoftBreaks, '=([0-9A-Fa-f]{2})', {
+        param($Match)
+        [char][Convert]::ToInt32($Match.Groups[1].Value, 16)
+    })
+}
+
+function ConvertTo-HtmlAttributeValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        return ''
+    }
+
+    return [System.Net.WebUtility]::HtmlEncode($Value)
+}
+
+function ConvertTo-CssUrlValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        return ''
+    }
+
+    return $Value.Replace('\', '\\').Replace('"', '\"')
+}
+
+function Get-PosterUrlFromEmbedBody {
+    param([string]$Body)
+
+    if ([string]::IsNullOrWhiteSpace($Body)) {
+        return $null
+    }
+
+    $decodedBody = [System.Net.WebUtility]::HtmlDecode((ConvertFrom-QuotedPrintableText $Body))
+    $patterns = @(
+        'background-image:\s*url\((?:&quot;|"|''|\\")?(?<url>https://dev\.epicgames\.com/community/api/cms/image/[^"''\)\s\\]+)',
+        'background-image:\s*url\((?:&quot;|"|''|\\")?(?<url>https://[^"''\)\s\\]+)'
+    )
+
+    foreach ($pattern in $patterns) {
+        $match = [regex]::Match($decodedBody, $pattern, 'IgnoreCase')
+        if ($match.Success) {
+            return $match.Groups['url'].Value
+        }
+    }
+
+    return $null
+}
+
 function Get-VideoPlayerHtml {
-    param([string]$VideoId)
+    param(
+        [string]$VideoId,
+        [string]$PosterUrl
+    )
 
     $mp4Link = "mp4/$VideoId.mp4"
+    $posterAttribute = ''
+    $posterStyle = ''
+
+    if (-not [string]::IsNullOrWhiteSpace($PosterUrl)) {
+        $posterAttribute = " poster=""$(ConvertTo-HtmlAttributeValue $PosterUrl)"""
+        $posterStyle = " background-image: url(""$(ConvertTo-CssUrlValue $PosterUrl)""); background-size: contain; background-position: center; background-repeat: no-repeat;"
+    }
 
     return @"
 <!DOCTYPE html>
@@ -66,12 +128,12 @@ video {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  background: #000;
+  background-color: #000;$posterStyle
 }
 </style>
 </head>
 <body>
-<video controls playsinline preload="metadata" src="$mp4Link"></video>
+<video controls playsinline preload="metadata"$posterAttribute src="$mp4Link"></video>
 </body>
 </html>
 "@
@@ -160,7 +222,9 @@ function Patch-EmbedPart {
 
     $nextBoundaryIndex = $bodyStart + $nextBoundaryMatch.Index
     $headers = $MhtmlText.Substring($boundaryIndex, $bodyStart - $boundaryIndex)
-    $html = Get-VideoPlayerHtml -VideoId $VideoId
+    $oldBody = $MhtmlText.Substring($bodyStart, $nextBoundaryIndex - $bodyStart)
+    $posterUrl = Get-PosterUrlFromEmbedBody $oldBody
+    $html = Get-VideoPlayerHtml -VideoId $VideoId -PosterUrl $posterUrl
     $lineEnding = Get-LineEnding $MhtmlText
 
     if ($headers -match '(?im)^Content-Transfer-Encoding:\s*quoted-printable\s*$') {
@@ -222,14 +286,6 @@ foreach ($group in $groups) {
     }
 
     if ($patchedInFile -gt 0) {
-        if (-not $NoBackup) {
-            $backupPath = "$mhtmlPath.bak"
-            if (-not (Test-Path -LiteralPath $backupPath)) {
-                Copy-Item -LiteralPath $mhtmlPath -Destination $backupPath
-                Write-Host "Backup created: $backupPath"
-            }
-        }
-
         [System.IO.File]::WriteAllText($mhtmlPath, $text, [System.Text.UTF8Encoding]::new($false))
         Write-Host "Saved patched MHTML: $patchedInFile embed(s)"
     }
