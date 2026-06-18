@@ -510,7 +510,8 @@ $downloaded = 0
 
 [void]$stack.Add([pscustomobject]@{
     Url = ([Uri]$Url).AbsoluteUri
-    Folder = $OutputRoot
+    SaveFolder = $OutputRoot
+    ChildFolder = $OutputRoot
 })
 
 while ($stack.Count -gt 0) {
@@ -529,7 +530,7 @@ while ($stack.Count -gt 0) {
     $visited[$key] = $true
 
     try {
-        $result = Save-BlueprintPageAsMhtml -PageUrl $task.Url -Folder $task.Folder
+        $result = Save-BlueprintPageAsMhtml -PageUrl $task.Url -Folder $task.SaveFolder
         $downloaded++
 
         $relativeFile = ConvertTo-RelativeRootPath $result.FilePath
@@ -543,10 +544,10 @@ while ($stack.Count -gt 0) {
             }
 
             $childFolderName = ConvertTo-SafeSegment -Value $action.name -MaxLength 90
-            $childFolder = Join-Path $task.Folder $childFolderName
             [void]$stack.Add([pscustomobject]@{
                 Url = [string]$action.url
-                Folder = $childFolder
+                SaveFolder = $task.ChildFolder
+                ChildFolder = (Join-Path $task.ChildFolder $childFolderName)
             })
         }
     }
