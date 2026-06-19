@@ -5,7 +5,7 @@ param(
     [int]$PageIdleSeconds = .1,
     [int]$PageLoadTimeoutSeconds = 3000,
     [int]$MaxLoadAttempts = 100000,
-    [int]$ParallelPages = 5,
+    [int]$ParallelPages = 6,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
     [switch]$WorkerMode,
@@ -694,8 +694,8 @@ function Save-BlueprintPageAsMhtmlInSession {
             [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl })
         }
         else {
-            Write-Warning "Reload halaman karena metadata belum lengkap: $PageUrl"
-            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
+            Write-Warning "Navigasi ulang ke URL error karena metadata belum lengkap: $PageUrl"
+            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl })
         }
 
         try {
