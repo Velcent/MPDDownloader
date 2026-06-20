@@ -488,6 +488,77 @@ function Get-PageFilePath {
     return (Join-Path $Folder "$baseName.mhtml")
 }
 
+function Get-NumberedSiblingPath {
+    param(
+        [string]$Path,
+        [int]$Index
+    )
+
+    if ($Index -le 0) {
+        return $Path
+    }
+
+    $directory = [System.IO.Path]::GetDirectoryName($Path)
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    $extension = [System.IO.Path]::GetExtension($Path)
+    return (Join-Path $directory "${name}_${Index}${extension}")
+}
+
+function Get-NumberedDirectoryPath {
+    param(
+        [string]$Path,
+        [int]$Index
+    )
+
+    if ($Index -le 0) {
+        return $Path
+    }
+
+    $directory = [System.IO.Path]::GetDirectoryName($Path)
+    $name = [System.IO.Path]::GetFileName($Path)
+    return (Join-Path $directory "${name}_${Index}")
+}
+
+function Write-TextToUniqueFile {
+    param(
+        [string]$Path,
+        [string]$Content,
+        [bool]$OverwriteFile
+    )
+
+    if ($OverwriteFile) {
+        [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
+        return $Path
+    }
+
+    for ($index = 0; ; $index++) {
+        $candidate = Get-NumberedSiblingPath -Path $Path -Index $index
+        $stream = $null
+        $writer = $null
+        try {
+            $stream = [System.IO.FileStream]::new($candidate, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $writer = [System.IO.StreamWriter]::new($stream, [System.Text.UTF8Encoding]::new($false))
+            $stream = $null
+            $writer.Write($Content)
+            return $candidate
+        }
+        catch [System.IO.IOException] {
+            if (Test-Path -LiteralPath $candidate) {
+                continue
+            }
+            throw
+        }
+        finally {
+            if ($writer) {
+                $writer.Dispose()
+            }
+            elseif ($stream) {
+                $stream.Dispose()
+            }
+        }
+    }
+}
+
 function ConvertFrom-QuotedPrintableText {
     param([string]$Text)
 
@@ -740,16 +811,10 @@ function Save-BlueprintPageAsMhtmlInSession {
     New-Item -ItemType Directory -Force -Path $Folder | Out-Null
     $filePath = Get-PageFilePath -Folder $Folder -Title $data.h1
 
-    $saved = $false
-    if ((Test-Path -LiteralPath $filePath) -and -not $Overwrite) {
-        Write-Host "Lewati file yang sudah ada: $(ConvertTo-RelativeRootPath $filePath)"
-    }
-    else {
-        $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
-        [System.IO.File]::WriteAllText($filePath, [string]$snapshot.result.data, [System.Text.UTF8Encoding]::new($false))
-        $saved = $true
-        Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath)"
-    }
+    $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
+    $filePath = Write-TextToUniqueFile -Path $filePath -Content ([string]$snapshot.result.data) -OverwriteFile $Overwrite.IsPresent
+    $saved = $true
+    Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath)"
 
     return [pscustomobject]@{
         OriginalUrl = $PageUrl
@@ -1043,6 +1108,41 @@ function Get-LinkTaskMap {
     return $map
 }
 
+function Test-LinkChildFolderExists {
+    param(
+        [System.Collections.Specialized.OrderedDictionary]$LinkMap,
+        [string]$Path
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    foreach ($entry in @($LinkMap.Values)) {
+        if (-not $entry -or [string]::IsNullOrWhiteSpace([string]$entry.ChildFolder)) {
+            continue
+        }
+
+        $entryPath = [System.IO.Path]::GetFullPath([string]$entry.ChildFolder)
+        if ($entryPath.Equals($fullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-UniqueLinkChildFolder {
+    param(
+        [System.Collections.Specialized.OrderedDictionary]$LinkMap,
+        [string]$Path
+    )
+
+    for ($index = 0; ; $index++) {
+        $candidate = Get-NumberedDirectoryPath -Path $Path -Index $index
+        if (-not (Test-LinkChildFolderExists -LinkMap $LinkMap -Path $candidate)) {
+            return $candidate
+        }
+    }
+}
+
 function Add-LinkTask {
     param(
         [System.Collections.Specialized.OrderedDictionary]$LinkMap,
@@ -1068,6 +1168,9 @@ function Add-LinkTask {
 
     $saveFolder = [System.IO.Path]::GetFullPath([string]$Task.SaveFolder)
     $childFolder = [System.IO.Path]::GetFullPath([string]$Task.ChildFolder)
+    $childFolder = Get-UniqueLinkChildFolder -LinkMap $LinkMap -Path $childFolder
+    $Task.SaveFolder = $saveFolder
+    $Task.ChildFolder = $childFolder
     $relativeSaveFolder = ConvertTo-RelativeRootPath $saveFolder
     $relativeChildFolder = ConvertTo-RelativeRootPath $childFolder
 
