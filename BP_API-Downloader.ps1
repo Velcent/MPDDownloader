@@ -272,6 +272,12 @@ function Assert-PageLoadOk {
 
     $title = [string]$Data.title
     $h1 = [string]$Data.h1
+    $htmlLength = if ($Data.PSObject.Properties['htmlLength']) { [int]$Data.htmlLength } else { 0 }
+
+    if ($h1 -eq 'One more step' -and $htmlLength -lt 102400) {
+        throw "Halaman terlihat error challenge: h1='$h1', size=$htmlLength bytes"
+    }
+
     if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout)\b') {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
