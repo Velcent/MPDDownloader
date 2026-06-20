@@ -996,6 +996,37 @@ function Get-DownloadedPageMap {
     return $map
 }
 
+function Get-LastDownloadedEntry {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    $line = Get-Content -LiteralPath $Path -Tail 1
+    if ([string]::IsNullOrWhiteSpace($line) -or $line -like "url`t*") {
+        return $null
+    }
+
+    $parts = [string]$line -split "`t", 5
+    if ($parts.Count -lt 5) {
+        return $null
+    }
+
+    $filePath = ConvertTo-LocalPathFromListValue $parts[1]
+    if ([string]::IsNullOrWhiteSpace($filePath) -or -not (Test-Path -LiteralPath $filePath)) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        Url = [string]$parts[0]
+        FilePath = $filePath
+        Title = [string]$parts[2]
+        ChildCount = if ($parts[3] -match '^\d+$') { [int]$parts[3] } else { 0 }
+        ParentUrl = [string]$parts[4]
+    }
+}
+
 function ConvertTo-TsvValue {
     param([string]$Value)
 
@@ -1174,7 +1205,6 @@ $rootTask = [pscustomobject]@{
     ChildFolder = $OutputRoot
 }
 [void](Add-LinkTask -LinkMap $linkMap -Task $rootTask -Name 'root' -ParentUrl '')
-Add-PendingLinkTasks -Queue $stack -LinkMap $linkMap -DownloadedMap $downloadedMap
 
 function Add-ChildTasks {
     param(
@@ -1213,6 +1243,54 @@ function Add-ChildTasks {
         [void]$Queue.Add($childTask)
     }
 }
+
+function Sync-LastDownloadedLinks {
+    param(
+        [hashtable]$DownloadedMap,
+        [System.Collections.Specialized.OrderedDictionary]$LinkMap
+    )
+
+    $entry = Get-LastDownloadedEntry -Path $ListPath
+    if (-not $entry) {
+        return
+    }
+
+    $result = Get-BlueprintDataFromMhtml -MhtmlPath $entry.FilePath -BaseUrl $entry.Url -FallbackTitle $entry.Title -FallbackParentUrl $entry.ParentUrl
+    if (-not $result) {
+        Write-Warning "Tidak bisa scan link dari file terakhir: $($entry.FilePath)"
+        return
+    }
+
+    $saveFolder = [System.IO.Path]::GetDirectoryName($entry.FilePath)
+    $childFolder = Join-Path $saveFolder (ConvertTo-SafeSegment -Value $result.Title -MaxLength 90)
+    try {
+        $key = Get-CanonicalUrlKey $entry.Url
+        if ($LinkMap.Contains($key)) {
+            $saveFolder = [string]$LinkMap[$key].SaveFolder
+            $childFolder = [string]$LinkMap[$key].ChildFolder
+        }
+    }
+    catch {
+    }
+
+    $task = [pscustomobject]@{
+        Url = [string]$entry.Url
+        SaveFolder = $saveFolder
+        ChildFolder = $childFolder
+    }
+
+    $beforeCount = $LinkMap.Count
+    $temporaryQueue = New-Object System.Collections.ArrayList
+    Add-ChildTasks -Queue $temporaryQueue -Seen @{} -DownloadedMap $DownloadedMap -LinkMap $LinkMap -Task $task -Result $result
+    $addedCount = $LinkMap.Count - $beforeCount
+
+    if ($addedCount -gt 0) {
+        Write-Host "Sync link dari file terakhir: tambah $addedCount link dari $(ConvertTo-RelativeRootPath $entry.FilePath)"
+    }
+}
+
+Sync-LastDownloadedLinks -DownloadedMap $downloadedMap -LinkMap $linkMap
+Add-PendingLinkTasks -Queue $stack -LinkMap $linkMap -DownloadedMap $downloadedMap
 
 function Write-ListEntry {
     param($Result)
