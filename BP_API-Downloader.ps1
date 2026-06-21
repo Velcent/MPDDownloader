@@ -1022,6 +1022,60 @@ function Get-DownloadedPageMap {
     return $map
 }
 
+function Get-DownloadedFilePathMap {
+    param([string]$Path)
+
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $map
+    }
+
+    try {
+        $rows = @(Import-Csv -LiteralPath $Path -Delimiter "`t")
+    }
+    catch {
+        Write-Warning "Tidak bisa membaca file list untuk sync path: $Path - $($_.Exception.Message)"
+        return $map
+    }
+
+    foreach ($row in $rows) {
+        try {
+            $filePath = ConvertTo-LocalPathFromListValue $row.file
+            if ([string]::IsNullOrWhiteSpace($filePath)) {
+                continue
+            }
+
+            $fullPath = [System.IO.Path]::GetFullPath($filePath)
+            $map[$fullPath.ToLowerInvariant()] = $true
+        }
+        catch {
+        }
+    }
+
+    return $map
+}
+
+function Get-MhtmlSourceUrl {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return ''
+    }
+
+    try {
+        $headerText = ((Get-Content -LiteralPath $Path -TotalCount 120) -join "`n")
+        $match = [regex]::Match($headerText, '(?im)^(?:Snapshot-Content-Location|Content-Location):\s*(?<url>https?://[^\r\n]+(?:\r?\n[ \t][^\r\n]+)*)')
+        if ($match.Success) {
+            $url = [regex]::Replace($match.Groups['url'].Value, "\r?\n[ \t]+", '')
+            return [System.Net.WebUtility]::HtmlDecode($url.Trim())
+        }
+    }
+    catch {
+    }
+
+    return ''
+}
+
 function Get-LastDownloadedEntry {
     param([string]$Path)
 
@@ -1284,6 +1338,97 @@ function Add-ChildTasks {
     }
 }
 
+function Add-DownloadedResultToList {
+    param(
+        $Result,
+        [switch]$AllowExistingUrl
+    )
+
+    if (-not $Result -or [string]::IsNullOrWhiteSpace([string]$Result.OriginalUrl)) {
+        return
+    }
+
+    $key = Get-CanonicalUrlKey ([string]$Result.OriginalUrl)
+    if ($downloadedMap.ContainsKey($key) -and -not $AllowExistingUrl) {
+        return
+    }
+
+    $relativeFile = if ($Result.RelativeFile) { $Result.RelativeFile } else { ConvertTo-RelativeRootPath $Result.FilePath }
+    Add-Content -LiteralPath $ListPath -Value "$($Result.OriginalUrl)`t$relativeFile`t$($Result.Title)`t$(@($Result.Actions).Count)`t$($Result.ParentUrl)" -Encoding UTF8
+
+    if (-not $downloadedMap.ContainsKey($key)) {
+        $downloadedMap[$key] = [pscustomobject]@{
+            Url = [string]$Result.OriginalUrl
+            FilePath = [string]$Result.FilePath
+            Title = [string]$Result.Title
+            ChildCount = @($Result.Actions).Count
+            ParentUrl = [string]$Result.ParentUrl
+        }
+    }
+}
+
+function Import-ExtraMhtmlFiles {
+    param(
+        [hashtable]$DownloadedMap,
+        [System.Collections.Specialized.OrderedDictionary]$LinkMap
+    )
+
+    if (-not (Test-Path -LiteralPath $OutputRoot)) {
+        return
+    }
+
+    $downloadedFiles = Get-DownloadedFilePathMap -Path $ListPath
+    $extraFiles = @(Get-ChildItem -LiteralPath $OutputRoot -Recurse -File -Filter '*.mhtml' | Where-Object {
+        -not $downloadedFiles.ContainsKey($_.FullName.ToLowerInvariant())
+    })
+
+    if ($extraFiles.Count -eq 0) {
+        return
+    }
+
+    Write-Host "Scan file MHTML ekstra sebelum online: $($extraFiles.Count) file"
+    foreach ($file in $extraFiles) {
+        $sourceUrl = Get-MhtmlSourceUrl -Path $file.FullName
+        if ([string]::IsNullOrWhiteSpace($sourceUrl)) {
+            Write-Warning "Lewati file ekstra tanpa URL sumber: $(ConvertTo-RelativeRootPath $file.FullName)"
+            continue
+        }
+
+        try {
+            $key = Get-CanonicalUrlKey $sourceUrl
+            $fallbackTitle = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+            $result = Get-BlueprintDataFromMhtml -MhtmlPath $file.FullName -BaseUrl $sourceUrl -FallbackTitle $fallbackTitle
+            if (-not $result) {
+                Write-Warning "Tidak bisa scan file ekstra: $(ConvertTo-RelativeRootPath $file.FullName)"
+                continue
+            }
+
+            $saveFolder = $file.DirectoryName
+            $childFolder = Join-Path $saveFolder ([System.IO.Path]::GetFileNameWithoutExtension($file.Name))
+            $task = [pscustomobject]@{
+                Url = [string]$sourceUrl
+                SaveFolder = $saveFolder
+                ChildFolder = $childFolder
+            }
+
+            $addedLink = Add-LinkTask -LinkMap $LinkMap -Task $task -Name $result.Title -ParentUrl $result.ParentUrl
+            if (-not $addedLink -and $LinkMap.Contains($key)) {
+                $task.SaveFolder = [string]$LinkMap[$key].SaveFolder
+                $task.ChildFolder = [string]$LinkMap[$key].ChildFolder
+                $task | Add-Member -NotePropertyName FileBaseName -NotePropertyValue ([string]$LinkMap[$key].FileBaseName) -Force
+            }
+
+            Add-DownloadedResultToList -Result $result -AllowExistingUrl
+            $temporaryQueue = New-Object System.Collections.ArrayList
+            Add-ChildTasks -Queue $temporaryQueue -Seen @{} -DownloadedMap $DownloadedMap -LinkMap $LinkMap -Task $task -Result $result
+            Write-Host "Adopsi MHTML ekstra: $(ConvertTo-RelativeRootPath $file.FullName)"
+        }
+        catch {
+            Write-Warning "Gagal adopsi file ekstra: $(ConvertTo-RelativeRootPath $file.FullName) - $($_.Exception.Message)"
+        }
+    }
+}
+
 function Sync-LastDownloadedLinks {
     param(
         [hashtable]$DownloadedMap,
@@ -1330,27 +1475,13 @@ function Sync-LastDownloadedLinks {
 }
 
 Sync-LastDownloadedLinks -DownloadedMap $downloadedMap -LinkMap $linkMap
+Import-ExtraMhtmlFiles -DownloadedMap $downloadedMap -LinkMap $linkMap
 Add-PendingLinkTasks -Queue $stack -LinkMap $linkMap -DownloadedMap $downloadedMap
 
 function Write-ListEntry {
     param($Result)
 
-    $relativeFile = if ($Result.RelativeFile) { $Result.RelativeFile } else { ConvertTo-RelativeRootPath $Result.FilePath }
-    Add-Content -LiteralPath $ListPath -Value "$($Result.OriginalUrl)`t$relativeFile`t$($Result.Title)`t$(@($Result.Actions).Count)`t$($Result.ParentUrl)" -Encoding UTF8
-
-    if (-not [string]::IsNullOrWhiteSpace([string]$Result.OriginalUrl)) {
-        try {
-            $downloadedMap[(Get-CanonicalUrlKey ([string]$Result.OriginalUrl))] = [pscustomobject]@{
-                Url = [string]$Result.OriginalUrl
-                FilePath = [string]$Result.FilePath
-                Title = [string]$Result.Title
-                ChildCount = @($Result.Actions).Count
-                ParentUrl = [string]$Result.ParentUrl
-            }
-        }
-        catch {
-        }
-    }
+    Add-DownloadedResultToList -Result $Result
 }
 
 function Get-NextTask {
