@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$InputPath = '',
-    [int]$MaxSizeKB = 300
+    [int]$MaxSizeKB = 650
 )
 
 Set-StrictMode -Version Latest
