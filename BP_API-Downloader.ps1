@@ -5,7 +5,7 @@ param(
     [int]$PageIdleSeconds = .1,
     [int]$PageLoadTimeoutSeconds = 3000,
     [int]$MaxLoadAttempts = 100000,
-    [int]$ParallelPages = 5,
+    [int]$ParallelPages = 6,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
     [switch]$WorkerMode,
@@ -25,6 +25,7 @@ $PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
 $ParallelPages = [Math]::Min(30, [Math]::Max(1, $ParallelPages))
 
+$MinimumMhtmlBytes = 300KB
 $MhtmlRoot = Join-Path $PSScriptRoot 'mhtml'
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 $ListPath = Join-Path $MhtmlRoot 'bp_api-list.tsv'
@@ -783,6 +784,8 @@ function Save-BlueprintPageAsMhtmlInSession {
     Write-Host "Buka Edge: $PageUrl"
 
     $data = $null
+    $filePath = ''
+    $saved = $false
     for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
         Reset-NetworkState
         if ($attempt -eq 1) {
@@ -802,6 +805,20 @@ function Save-BlueprintPageAsMhtmlInSession {
 
             $data = Wait-BlueprintPageReady -Socket $Socket -PageUrl $PageUrl -Attempt $attempt
             Assert-PageLoadOk -Data $data
+
+            New-Item -ItemType Directory -Force -Path $Folder | Out-Null
+            $filePath = Get-PageFilePath -Folder $Folder -Title $data.h1 -FileBaseName $FileBaseName
+
+            $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
+            $snapshotData = [string]$snapshot.result.data
+            $snapshotBytes = [System.Text.Encoding]::UTF8.GetByteCount($snapshotData)
+            if ($snapshotBytes -lt $MinimumMhtmlBytes) {
+                throw "MHTML terlalu kecil: $snapshotBytes bytes (< $MinimumMhtmlBytes bytes)"
+            }
+
+            [System.IO.File]::WriteAllText($filePath, $snapshotData, [System.Text.UTF8Encoding]::new($false))
+            $saved = $true
+            Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath) ($snapshotBytes bytes)"
             break
         }
         catch {
@@ -811,14 +828,6 @@ function Save-BlueprintPageAsMhtmlInSession {
             Write-Warning $_.Exception.Message
         }
     }
-
-    New-Item -ItemType Directory -Force -Path $Folder | Out-Null
-    $filePath = Get-PageFilePath -Folder $Folder -Title $data.h1 -FileBaseName $FileBaseName
-
-    $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
-    [System.IO.File]::WriteAllText($filePath, [string]$snapshot.result.data, [System.Text.UTF8Encoding]::new($false))
-    $saved = $true
-    Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath)"
 
     return [pscustomobject]@{
         OriginalUrl = $PageUrl
