@@ -25,7 +25,7 @@ if (-not $StrippedMhtmlRoot) {
 }
 
 if (-not $TsvPath) {
-    $TsvPath = Join-Path $PSScriptRoot 'mhtml-uuid.tsv'
+    $TsvPath = Join-Path $AssetsRoot 'mhtml-uuid.tsv'
 }
 
 $BinRoot = Join-Path $AssetsRoot 'bin'
@@ -452,6 +452,7 @@ function Import-ExistingUrlMap {
 
 New-Item -ItemType Directory -Force -Path $BinRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $StrippedMhtmlRoot | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TsvPath) | Out-Null
 
 $files = Get-InputMhtmlFiles -Path $InputPath
 $inputItem = Get-Item -LiteralPath $InputPath
