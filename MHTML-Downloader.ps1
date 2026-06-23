@@ -523,11 +523,23 @@ function Get-IndexPathForXml {
     return (Join-Path $folder "$baseName-$Kind.tsv")
 }
 
+function Update-ListBackup {
+    param([string]$ListPath)
+
+    if ([string]::IsNullOrWhiteSpace($ListPath) -or -not (Test-Path -LiteralPath $ListPath)) {
+        return
+    }
+
+    $backupPath = [System.IO.Path]::ChangeExtension($ListPath, '.bak')
+    Copy-Item -LiteralPath $ListPath -Destination $backupPath -Force
+}
+
 function Ensure-ListFile {
     param([string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path) -or (Get-Item -LiteralPath $Path).Length -eq 0) {
         Set-Content -LiteralPath $Path -Value "url`tfile`ttitle`tchild_count`tparent_url`tsource_xml`tsaved" -Encoding UTF8
+        Update-ListBackup -ListPath $Path
     }
 }
 
@@ -1082,6 +1094,7 @@ function Add-DownloadedResultToList {
         "$(ConvertTo-TsvValue (ConvertTo-RelativeRootPath $Result.SourceXml))`t" +
         "$(ConvertTo-TsvValue ([string]$Result.Saved))"
     ) -Encoding UTF8
+    Update-ListBackup -ListPath $listPath
     $FileMap[$fileKey] = $true
 }
 
