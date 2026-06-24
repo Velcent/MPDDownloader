@@ -773,6 +773,12 @@ foreach ($mhtmlFile in $mhtmlFiles) {
                 Mp4Path = $mp4Path
             }
         }
+
+        $listEntries += [pscustomobject]@{
+            MhtmlPath = $mhtmlFile.FullName
+            EmbedUrl = $youtubeUrl
+            Mp4Path = $mp4Path
+        }
     }
 
     if (-not $embedUrls) {
