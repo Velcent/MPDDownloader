@@ -356,10 +356,16 @@ function Get-LearningSnapshotExpression {
   }
 
   const learningList = document.querySelector('learning-list') || document.querySelector('[class*="learning-list" i]');
-  const linkScope = learningList || document;
   const seen = new Set();
   const items = [];
-  linkScope.querySelectorAll('a[href]').forEach((anchor) => {
+  const listItems = learningList ? Array.from(learningList.querySelectorAll('li')) : [];
+  listItems.forEach((li) => {
+    const heading = li.querySelector('h6');
+    if (!heading) return;
+
+    const anchor = heading.closest('a[href]') || heading.parentElement?.closest('a[href]');
+    if (!anchor) return;
+
     const url = toUrl(anchor.getAttribute('href'));
     if (!url || seen.has(url)) return;
     const parsed = new URL(url);
@@ -367,8 +373,7 @@ function Get-LearningSnapshotExpression {
     if (!/\/community\//i.test(parsed.pathname)) return;
     if (/\/learning(?:\/page\/\d+)?\/?$/i.test(parsed.pathname)) return;
 
-    const titleEl = anchor.querySelector('h1,h2,h3,h4,[class*="title" i],[class*="heading" i]');
-    const title = normalize(anchor.getAttribute('aria-label') || anchor.getAttribute('title') || titleEl?.textContent || anchor.textContent || url);
+    const title = normalize(heading.textContent || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || url);
     if (!title) return;
 
     seen.add(url);
@@ -880,34 +885,48 @@ function Stop-LearningWorkers {
 function ConvertTo-LearningXml {
     param(
         $Target,
-        [object[]]$Items
+        [object[]]$PageResults
     )
 
     $lines = New-Object System.Collections.ArrayList
     [void]$lines.Add(('<div class="contents-table-el is-active is-root-entry"><a class="contents-table-link is-parent" href="{0}">{1}</a></div>' -f (ConvertTo-XmlAttributeValue $Target.RootUrl), (ConvertTo-XmlAttributeValue $Target.Title)))
     [void]$lines.Add('<ul class="contents-table-list">')
 
-    $seen = @{}
-    foreach ($item in @($Items)) {
-        if (-not $item -or [string]::IsNullOrWhiteSpace([string]$item.url)) {
+    foreach ($pageResult in @($PageResults | Sort-Object Page)) {
+        if (-not $pageResult) {
             continue
         }
 
-        $key = Get-CanonicalUrlKey ([string]$item.url)
-        if ($seen.ContainsKey($key)) {
-            continue
-        }
-        $seen[$key] = $true
-
-        $title = ConvertTo-SafeText ([string]$item.title)
-        if ([string]::IsNullOrWhiteSpace($title)) {
-            $title = [string]$item.url
+        $pageNumber = [int]$pageResult.Page
+        $pageUrl = [string]$pageResult.PageUrl
+        if ([string]::IsNullOrWhiteSpace($pageUrl)) {
+            $pageUrl = ConvertTo-PageUrl -RootUrl $Target.RootUrl -Page $pageNumber
         }
 
-        $href = ConvertTo-XmlAttributeValue ([string]$item.url)
-        $label = ConvertTo-XmlAttributeValue $title
+        $pageHref = ConvertTo-XmlAttributeValue $pageUrl
+        $pageLabel = ConvertTo-XmlAttributeValue ("Page $pageNumber")
         [void]$lines.Add("`t<li class=""contents-table-item"">")
-        [void]$lines.Add(('`t`t<div class="contents-table-el"><a class="contents-table-link" href="{0}">{1}</a></div>' -f $href, $label))
+        [void]$lines.Add("`t`t<div class=""contents-table-el""><a class=""contents-table-link is-parent"" href=""$pageHref"">$pageLabel</a></div>")
+        [void]$lines.Add("`t`t<ul class=""contents-table-list"">")
+
+        foreach ($item in @($pageResult.Items)) {
+            if (-not $item -or [string]::IsNullOrWhiteSpace([string]$item.url)) {
+                continue
+            }
+
+            $title = ConvertTo-SafeText ([string]$item.title)
+            if ([string]::IsNullOrWhiteSpace($title)) {
+                $title = [string]$item.url
+            }
+
+            $href = ConvertTo-XmlAttributeValue ([string]$item.url)
+            $label = ConvertTo-XmlAttributeValue $title
+            [void]$lines.Add("`t`t`t<li class=""contents-table-item"">")
+            [void]$lines.Add("`t`t`t`t<div class=""contents-table-el""><a class=""contents-table-link"" href=""$href"">$label</a></div>")
+            [void]$lines.Add("`t`t`t</li>")
+        }
+
+        [void]$lines.Add("`t`t</ul>")
         [void]$lines.Add("`t</li>")
     }
 
@@ -1058,9 +1077,9 @@ foreach ($target in $Targets) {
         }
     }
 
-    $xmlLines = ConvertTo-LearningXml -Target $target -Items @($items)
+    $xmlLines = ConvertTo-LearningXml -Target $target -PageResults $targetResults
     Set-Content -LiteralPath $target.OutputPath -Value $xmlLines -Encoding UTF8
-    Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($(@($items).Count) link mentah)"
+    Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($($targetResults.Count) page, $(@($items).Count) link mentah)"
 }
 
 Write-Host ""
