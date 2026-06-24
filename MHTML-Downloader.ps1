@@ -525,7 +525,7 @@ function Assert-PageLoadOk {
         throw "Halaman terlihat error challenge: h1='$h1', size=$htmlLength bytes"
     }
 
-    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|refused|unreachable|timed out|can''t be reached)\b') {
+    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|refused|unreachable|can''t be reached)\b') {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
 }
