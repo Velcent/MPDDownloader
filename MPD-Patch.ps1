@@ -37,6 +37,51 @@ function Get-VideoIdFromEmbedUrl {
     return $null
 }
 
+function Get-YoutubeVideoIdFromUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return $null
+    }
+
+    $decoded = [System.Net.WebUtility]::HtmlDecode($Url).Replace('\/', '/')
+    $patterns = @(
+        '(?i)(?:(?:www\.)?youtube(?:-nocookie)?\.com/(?:embed|shorts|live)/|youtu\.be/)(?<id>[A-Za-z0-9_-]{11})',
+        '(?i)(?:www\.)?youtube(?:-nocookie)?\.com/.*?[?&]v=(?<id>[A-Za-z0-9_-]{11})'
+    )
+
+    foreach ($pattern in $patterns) {
+        $match = [regex]::Match($decoded, $pattern)
+        if ($match.Success) {
+            return $match.Groups['id'].Value
+        }
+    }
+
+    return $null
+}
+
+function Get-VideoPatchInfo {
+    param([string]$Url)
+
+    $epicId = Get-VideoIdFromEmbedUrl $Url
+    if ($epicId) {
+        return [pscustomobject]@{
+            Kind = 'epic'
+            Id = $epicId
+        }
+    }
+
+    $youtubeId = Get-YoutubeVideoIdFromUrl $Url
+    if ($youtubeId) {
+        return [pscustomobject]@{
+            Kind = 'youtube'
+            Id = $youtubeId
+        }
+    }
+
+    return $null
+}
+
 function ConvertTo-QuotedPrintableHtml {
     param([string]$Html)
 
@@ -102,11 +147,11 @@ function Get-VideoPlayerHtml {
         [string]$PosterUrl
     )
 
-    $mp4Link = "https://media.local/video/mp4/$VideoId.mp4"
-    $background = '#000'
+    $mp4Source = "$(ConvertTo-HtmlAttributeValue "$VideoId.mp4")"
+    $posterAttribute = ''
 
     if (-not [string]::IsNullOrWhiteSpace($PosterUrl)) {
-        $background = "#000 url(""$(ConvertTo-CssUrlValue $PosterUrl)"") center / contain no-repeat"
+        $posterAttribute = " poster=""$(ConvertTo-HtmlAttributeValue $PosterUrl)"""
     }
 
     return @"
@@ -122,39 +167,17 @@ html, body {
   background: #000;
 }
 
-.video-link {
-  display: block;
+.video-player {
   width: 100%;
   height: 100%;
-  background: $background;
-  position: relative;
-}
-
-.play {
-  position: absolute;
-  inset: 0;
-  margin: auto;
-  width: 72px;
-  height: 72px;
-  border-radius: 50%;
-  background: rgba(0,0,0,.55);
-}
-
-.play::after {
-  content: "";
-  position: absolute;
-  left: 29px;
-  top: 22px;
-  border-left: 24px solid white;
-  border-top: 14px solid transparent;
-  border-bottom: 14px solid transparent;
+  display: block;
+  object-fit: contain;
+  background: #000;
 }
 </style>
 </head>
 <body>
-<a class="video-link" href="$mp4Link">
-  <span class="play"></span>
-</a>
+<video class="video-player" src="$mp4Source"$posterAttribute controls preload="metadata"></video>
 </body>
 </html>
 "@
@@ -196,15 +219,45 @@ function Find-HeaderBodySeparator {
     }
 }
 
+function Find-VideoContentLocationIndex {
+    param(
+        [string]$MhtmlText,
+        [string]$EmbedUrl,
+        [string]$VideoId,
+        [string]$Kind
+    )
+
+    if ($Kind -eq 'epic') {
+        $contentLocation = "Content-Location: $EmbedUrl"
+        return $MhtmlText.IndexOf($contentLocation, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    foreach ($match in [regex]::Matches($MhtmlText, 'Content-Location:\s*(?<url>https?://[^\r\n]+youtube[^\r\n]+)', 'IgnoreCase')) {
+        $contentLocationUrl = $match.Groups['url'].Value.Trim()
+        if ((Get-YoutubeVideoIdFromUrl $contentLocationUrl) -eq $VideoId) {
+            return $match.Index
+        }
+    }
+
+    foreach ($match in [regex]::Matches($MhtmlText, 'Content-Location:\s*(?<url>https?://youtu\.be/[^\r\n]+)', 'IgnoreCase')) {
+        $contentLocationUrl = $match.Groups['url'].Value.Trim()
+        if ((Get-YoutubeVideoIdFromUrl $contentLocationUrl) -eq $VideoId) {
+            return $match.Index
+        }
+    }
+
+    return -1
+}
+
 function Patch-EmbedPart {
     param(
         [string]$MhtmlText,
         [string]$EmbedUrl,
-        [string]$VideoId
+        [string]$VideoId,
+        [string]$Kind
     )
 
-    $contentLocation = "Content-Location: $EmbedUrl"
-    $contentLocationIndex = $MhtmlText.IndexOf($contentLocation, [System.StringComparison]::OrdinalIgnoreCase)
+    $contentLocationIndex = Find-VideoContentLocationIndex -MhtmlText $MhtmlText -EmbedUrl $EmbedUrl -VideoId $VideoId -Kind $Kind
     if ($contentLocationIndex -lt 0) {
         Write-Warning "Embed URL not found in MHTML: $EmbedUrl"
         return @{
@@ -265,7 +318,7 @@ function Patch-EmbedPart {
 }
 
 $rows = Import-Csv -LiteralPath $ListPath -Delimiter "`t" | Where-Object {
-    $_.mhtml_file -and $_.embed_html
+    $_.mhtml_file -and $_.embed_html -and (Get-VideoPatchInfo $_.embed_html)
 }
 
 if (-not $rows) {
@@ -290,19 +343,20 @@ foreach ($group in $groups) {
     $patchedInFile = 0
 
     foreach ($row in $group.Group) {
-        $videoId = Get-VideoIdFromEmbedUrl $row.embed_html
-        if (-not $videoId) {
+        $patchInfo = Get-VideoPatchInfo $row.embed_html
+        if (-not $patchInfo) {
             Write-Warning "Cannot parse video id from embed URL: $($row.embed_html)"
             continue
         }
 
-        $result = Patch-EmbedPart -MhtmlText $text -EmbedUrl $row.embed_html -VideoId $videoId
+        $videoId = $patchInfo.Id
+        $result = Patch-EmbedPart -MhtmlText $text -EmbedUrl $row.embed_html -VideoId $videoId -Kind $patchInfo.Kind
         $text = $result.Text
 
         if ($result.Patched) {
             $patchedInFile++
             $totalPatched++
-            Write-Host "Patched embed: $videoId -> video/mp4/$videoId.mp4"
+            Write-Host "Patched embed: $videoId -> $videoId.mp4"
         }
     }
 
@@ -317,3 +371,4 @@ foreach ($group in $groups) {
 
 Write-Host ""
 Write-Host "Done. Patched $totalPatched embed(s)."
+pause
