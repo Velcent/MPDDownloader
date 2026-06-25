@@ -1,6 +1,7 @@
-Get-ChildItem -Path . -Filter *.mhtml -Recurse | ForEach-Object {
+Get-ChildItem -Path .\mhtml -Filter *.mhtml -Recurse | ForEach-Object {
     $content = Get-Content $_.FullName -Raw
     $content = $content -replace "=`r`n(?!`r`n)", ""
+    $content = $content -replace "<!---->", ""
     $content = $content -replace '
     (?sx)
     <div id=3D"top"></div>
