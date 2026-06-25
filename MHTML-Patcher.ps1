@@ -5,6 +5,7 @@ Get-ChildItem -Path .\mhtml -Filter *.mhtml -Recurse | ForEach-Object {
     $content = $content -replace '
     (?sx)
     <div id=3D"top"></div>
+    |<source.*?>
     |<site-header.*?</site-header>
     |<side-panel.*?</side-panel>
     |<site-modal.*?</site-modal>
