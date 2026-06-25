@@ -396,18 +396,8 @@ function Write-BodyFromAssetFile {
     )
 
     $bytes = [System.IO.File]::ReadAllBytes($AssetPath)
-    if ($Encoding -and $Encoding.ToLowerInvariant() -eq 'base64') {
-        Write-Base64Body -Writer $Writer -Bytes $bytes
-        return
-    }
-
-    if ($bytes.Length -gt 0) {
-        $Writer.Write($Latin1.GetString($bytes))
-        $lastByte = $bytes[$bytes.Length - 1]
-        if ($lastByte -ne 10 -and $lastByte -ne 13) {
-            $Writer.Write("`r`n")
-        }
-    }
+    $effectiveEncoding = if ($Encoding) { $Encoding } else { 'base64' }
+    Write-MimeBody -Writer $Writer -Bytes $bytes -Encoding $effectiveEncoding
 }
 
 function Test-MimeBoundaryLine {
