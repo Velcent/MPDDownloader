@@ -36,6 +36,7 @@ if (-not $TsvPath) {
 }
 
 $BinRoot = Join-Path $AssetsRoot 'bin'
+$VideoMp4Root = Join-Path $PSScriptRoot 'video\mp4'
 $ScriptRootFull = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $script:BrowserProfileDir = Join-Path $AssetsRoot '.edge-profile'
 
@@ -560,6 +561,50 @@ function Resolve-ExternalUrl {
     return ''
 }
 
+function Resolve-AssetLink {
+    param(
+        [string]$RawUrl,
+        [string]$BaseUrl,
+        [switch]$AllowRelative
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RawUrl)) {
+        return ''
+    }
+
+    $value = [System.Net.WebUtility]::HtmlDecode($RawUrl.Trim())
+    if ($value -match '(?i)^(data|cid|blob|javascript|mailto):') {
+        return ''
+    }
+
+    try {
+        if ($value.StartsWith('//')) {
+            if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
+                $baseUri = [Uri]$BaseUrl
+                return "$($baseUri.Scheme):$value"
+            }
+
+            return "https:$value"
+        }
+
+        if ([Uri]::IsWellFormedUriString($value, [UriKind]::Absolute)) {
+            return ([Uri]$value).AbsoluteUri
+        }
+
+        if ($AllowRelative) {
+            return $value
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
+            return ([Uri]::new([Uri]$BaseUrl, $value)).AbsoluteUri
+        }
+    }
+    catch {
+    }
+
+    return ''
+}
+
 function Get-HtmlBaseUrl {
     param(
         [string]$Html,
@@ -629,44 +674,295 @@ function Get-ImgUrlsFromHtml {
     return @($urls)
 }
 
-function Get-MissingImgUrlsFromMhtml {
+function Add-AssetReference {
+    param(
+        $Results,
+        $Seen,
+        [string]$Link,
+        [string]$FetchMode,
+        [string]$ContentType = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Link) -or $Seen.ContainsKey($Link)) {
+        return
+    }
+
+    $Seen[$Link] = $true
+    $Results.Add([pscustomobject]@{
+        link = $Link
+        fetch_mode = $FetchMode
+        content_type = $ContentType
+    }) | Out-Null
+}
+
+function Get-HttpsBackgroundUrlsFromCss {
+    param(
+        [string]$CssText,
+        [string]$BaseUrl
+    )
+
+    $urls = New-Object System.Collections.ArrayList
+    $seen = @{}
+
+    foreach ($declaration in [regex]::Matches($CssText, '(?is)\bbackground(?:-image)?\s*:\s*(?<value>[^;{}]+)')) {
+        $value = $declaration.Groups['value'].Value
+        foreach ($urlMatch in [regex]::Matches($value, '(?is)url\(\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)''|(?<bare>[^)\s]+))\s*\)')) {
+            foreach ($name in @('dq', 'sq', 'bare')) {
+                if ($urlMatch.Groups[$name].Success) {
+                    $url = Resolve-ExternalUrl -RawUrl $urlMatch.Groups[$name].Value -BaseUrl $BaseUrl
+                    if ($url -and $url -match '^https://' -and -not $seen.ContainsKey($url)) {
+                        $seen[$url] = $true
+                        [void]$urls.Add($url)
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    return [object[]]$urls
+}
+
+function Get-AssetReferencesFromHtml {
+    param(
+        [string]$Html,
+        [string]$BaseUrl
+    )
+
+    $results = New-Object System.Collections.ArrayList
+    $seen = @{}
+
+    try {
+        foreach ($imgUrl in Get-ImgUrlsFromHtml -Html $Html -BaseUrl $BaseUrl) {
+            Add-AssetReference -Results $results -Seen $seen -Link $imgUrl -FetchMode 'browser'
+        }
+    }
+    catch {
+        throw "Get-AssetReferencesFromHtml/img: $($_.Exception.Message)"
+    }
+
+    try {
+        foreach ($video in [regex]::Matches($Html, '(?is)<video\b(?<attrs>[^>]*)>')) {
+            $attrs = $video.Groups['attrs'].Value
+
+            foreach ($attr in [regex]::Matches($attrs, '(?is)\bsrc\s*=\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)''|(?<bare>[^\s>]+))')) {
+                foreach ($name in @('dq', 'sq', 'bare')) {
+                    if ($attr.Groups[$name].Success) {
+                        $link = Resolve-AssetLink -RawUrl $attr.Groups[$name].Value -BaseUrl $BaseUrl -AllowRelative
+                        if ($link) {
+                            Add-AssetReference -Results $results -Seen $seen -Link $link -FetchMode 'local-video' -ContentType 'video/mp4'
+                        }
+                        break
+                    }
+                }
+            }
+
+            foreach ($attr in [regex]::Matches($attrs, '(?is)\bposter\s*=\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)''|(?<bare>[^\s>]+))')) {
+                foreach ($name in @('dq', 'sq', 'bare')) {
+                    if ($attr.Groups[$name].Success) {
+                        $url = Resolve-ExternalUrl -RawUrl $attr.Groups[$name].Value -BaseUrl $BaseUrl
+                        if ($url -and $url -match '^https://') {
+                            Add-AssetReference -Results $results -Seen $seen -Link $url -FetchMode 'browser'
+                        }
+                        break
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        throw "Get-AssetReferencesFromHtml/video: $($_.Exception.Message)"
+    }
+
+    try {
+        foreach ($videoBody in [regex]::Matches($Html, '(?is)<video\b[^>]*>(?<body>.*?)</video>')) {
+            $body = $videoBody.Groups['body'].Value
+            foreach ($source in [regex]::Matches($body, '(?is)<source\b(?<attrs>[^>]*)>')) {
+                $attrs = $source.Groups['attrs'].Value
+                foreach ($attr in [regex]::Matches($attrs, '(?is)\bsrc\s*=\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)''|(?<bare>[^\s>]+))')) {
+                    foreach ($name in @('dq', 'sq', 'bare')) {
+                        if ($attr.Groups[$name].Success) {
+                            $link = Resolve-AssetLink -RawUrl $attr.Groups[$name].Value -BaseUrl $BaseUrl -AllowRelative
+                            if ($link) {
+                                Add-AssetReference -Results $results -Seen $seen -Link $link -FetchMode 'local-video' -ContentType 'video/mp4'
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        throw "Get-AssetReferencesFromHtml/source: $($_.Exception.Message)"
+    }
+
+    try {
+        foreach ($styleBlock in [regex]::Matches($Html, '(?is)<style\b[^>]*>(?<css>.*?)</style>')) {
+            foreach ($cssUrl in Get-HttpsBackgroundUrlsFromCss -CssText $styleBlock.Groups['css'].Value -BaseUrl $BaseUrl) {
+                Add-AssetReference -Results $results -Seen $seen -Link $cssUrl -FetchMode 'browser'
+            }
+        }
+    }
+    catch {
+        throw "Get-AssetReferencesFromHtml/style-block: $($_.Exception.Message)"
+    }
+
+    try {
+        foreach ($styleAttr in [regex]::Matches($Html, '(?is)\bstyle\s*=\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)'')')) {
+            foreach ($name in @('dq', 'sq')) {
+                if ($styleAttr.Groups[$name].Success) {
+                    foreach ($cssUrl in Get-HttpsBackgroundUrlsFromCss -CssText $styleAttr.Groups[$name].Value -BaseUrl $BaseUrl) {
+                        Add-AssetReference -Results $results -Seen $seen -Link $cssUrl -FetchMode 'browser'
+                    }
+                    break
+                }
+            }
+        }
+    }
+    catch {
+        throw "Get-AssetReferencesFromHtml/style-attr: $($_.Exception.Message)"
+    }
+
+    return [object[]]$results
+}
+
+function Get-MissingAssetRefsFromMhtml {
     param(
         [object[]]$Parts,
         [string]$SnapshotLocation,
         [System.Collections.Generic.Dictionary[string,bool]]$PartLocations
     )
 
-    $htmlPart = $null
+    $missing = New-Object System.Collections.ArrayList
+    $seen = @{}
+
     foreach ($part in @($Parts)) {
-        $location = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Location' -Url
         $contentType = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Type'
-        if (($SnapshotLocation -and $location -eq $SnapshotLocation) -or $contentType -match '(?i)^text/html\b') {
-            $htmlPart = $part
-            break
+        if ($contentType) {
+            $contentType = (($contentType -split ';', 2)[0]).Trim()
+        }
+
+        if ($contentType -notmatch '(?i)^text/(html|css)\b' -or [string]::IsNullOrEmpty($part.Body)) {
+            continue
+        }
+
+        $encoding = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Transfer-Encoding'
+        if (-not $encoding) {
+            $encoding = '7bit'
+        }
+
+        try {
+            $bytes = Decode-MimeBody -Body $part.Body -Encoding $encoding
+        }
+        catch {
+            continue
+        }
+
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        $location = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Location' -Url
+        $refs = @()
+
+        if ($contentType -match '(?i)^text/html\b') {
+            $fallbackUrl = if ($location) { $location } else { $SnapshotLocation }
+            $baseUrl = Get-HtmlBaseUrl -Html $text -FallbackUrl $fallbackUrl
+            $refs = @(Get-AssetReferencesFromHtml -Html $text -BaseUrl $baseUrl)
+        }
+        elseif ($contentType -match '(?i)^text/css\b') {
+            $baseUrl = if ($location) { $location } else { $SnapshotLocation }
+            foreach ($cssUrl in Get-HttpsBackgroundUrlsFromCss -CssText $text -BaseUrl $baseUrl) {
+                $refs += [pscustomobject]@{
+                    link = $cssUrl
+                    fetch_mode = 'browser'
+                    content_type = ''
+                }
+            }
+        }
+
+        foreach ($ref in @($refs)) {
+            if (-not $ref.link -or $PartLocations.ContainsKey([string]$ref.link) -or $seen.ContainsKey([string]$ref.link)) {
+                continue
+            }
+
+            $seen[[string]$ref.link] = $true
+            [void]$missing.Add($ref)
         }
     }
 
-    if (-not $htmlPart -or [string]::IsNullOrEmpty($htmlPart.Body)) {
-        return @()
+    return [object[]]$missing
+}
+
+function Resolve-LocalVideoFilePath {
+    param(
+        [string]$Link,
+        [string]$VideoRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Link) -or -not (Test-Path -LiteralPath $VideoRoot)) {
+        return ''
     }
 
-    $encoding = Get-UnfoldedHeaderValue -Headers $htmlPart.Headers -Name 'Content-Transfer-Encoding'
-    if (-not $encoding) {
-        $encoding = '7bit'
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
+
+    function Add-CandidateName {
+        param([string]$Name)
+
+        if ([string]::IsNullOrWhiteSpace($Name)) {
+            return
+        }
+
+        $value = $Name.Trim()
+        if ($seen.ContainsKey($value)) {
+            return
+        }
+
+        $seen[$value] = $true
+        $candidates.Add($value) | Out-Null
     }
 
-    $bytes = Decode-MimeBody -Body $htmlPart.Body -Encoding $encoding
-    $html = [System.Text.Encoding]::UTF8.GetString($bytes)
-    $baseUrl = Get-HtmlBaseUrl -Html $html -FallbackUrl $SnapshotLocation
-    $missing = New-Object 'System.Collections.Generic.List[string]'
+    $decoded = [System.Net.WebUtility]::HtmlDecode($Link.Trim())
+    $pathOnly = ($decoded -split '[?#]', 2)[0].Trim()
 
-    foreach ($url in Get-ImgUrlsFromHtml -Html $html -BaseUrl $baseUrl) {
-        if (-not $PartLocations.ContainsKey($url)) {
-            $missing.Add($url) | Out-Null
+    try {
+        if ([Uri]::IsWellFormedUriString($decoded, [UriKind]::Absolute)) {
+            $uri = [Uri]$decoded
+            Add-CandidateName -Name ([System.IO.Path]::GetFileName($uri.AbsolutePath))
+            Add-CandidateName -Name ([System.IO.Path]::GetFileNameWithoutExtension($uri.AbsolutePath))
+        }
+    }
+    catch {
+    }
+
+    Add-CandidateName -Name ([System.IO.Path]::GetFileName($pathOnly))
+    Add-CandidateName -Name ([System.IO.Path]::GetFileNameWithoutExtension($pathOnly))
+
+    foreach ($match in [regex]::Matches($decoded, '(?i)(?<token>[A-Za-z0-9_-]{6,})(?:\.mp4)?')) {
+        Add-CandidateName -Name $match.Groups['token'].Value
+    }
+
+    foreach ($candidate in @($candidates)) {
+        $testNames = New-Object 'System.Collections.Generic.List[string]'
+        if ($candidate -match '(?i)\.mp4$') {
+            $testNames.Add($candidate) | Out-Null
+        }
+        else {
+            $testNames.Add("$candidate.mp4") | Out-Null
+        }
+
+        if ($candidate -notmatch '^(?i)V_' -and $candidate -notmatch '(?i)\.mp4$') {
+            $testNames.Add("V_$candidate.mp4") | Out-Null
+        }
+
+        foreach ($testName in $testNames) {
+            $fullPath = Join-Path $VideoRoot $testName
+            if (Test-Path -LiteralPath $fullPath) {
+                return $fullPath
+            }
         }
     }
 
-    return @($missing)
+    return ''
 }
 
 function Get-EdgePath {
@@ -1201,6 +1497,7 @@ $stats = [ordered]@{
     DownloadedImgUrls = 0
     FailedImgUrls = 0
     AddedMissingImgParts = 0
+    LinkedLocalVideoUrls = 0
     SkippedExistingUrls = 0
     SkippedSnapshotParts = 0
     SkippedNonHttpsParts = 0
@@ -1311,8 +1608,9 @@ foreach ($file in $files) {
     }
 
     $missingImgParts = New-Object System.Collections.Generic.List[object]
-    foreach ($imgUrl in Get-MissingImgUrlsFromMhtml -Parts $parts -SnapshotLocation $snapshotLocation -PartLocations $filePartLocations) {
-        if ($filePartLocations.ContainsKey($imgUrl)) {
+    foreach ($assetRef in Get-MissingAssetRefsFromMhtml -Parts $parts -SnapshotLocation $snapshotLocation -PartLocations $filePartLocations) {
+        $assetLink = [string]$assetRef.link
+        if (-not $assetLink -or $filePartLocations.ContainsKey($assetLink)) {
             continue
         }
 
@@ -1320,28 +1618,24 @@ foreach ($file in $files) {
         $imgRow = $null
         $contentType = ''
 
-        if ($urlToRow.ContainsKey($imgUrl)) {
-            $imgRow = $urlToRow[$imgUrl]
+        if ($urlToRow.ContainsKey($assetLink)) {
+            $imgRow = $urlToRow[$assetLink]
             $contentType = Get-ContentTypeForManifestRow -Row $imgRow
-            if (-not $seenRows.ContainsKey($imgUrl)) {
-                $seenRows[$imgUrl] = $true
+            if (-not $seenRows.ContainsKey($assetLink)) {
+                $seenRows[$assetLink] = $true
                 $rows.Add($imgRow) | Out-Null
             }
             $stats.SkippedExistingUrls++
         }
-        else {
-            try {
-                $assetSocket = Get-AssetSessionSocket -Session $assetSession
-                if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
-                    if ($assetSession) {
-                        Close-AssetDownloadSession -Session $assetSession
-                    }
-                    $assetSession = New-AssetDownloadSession
-                }
+        elseif ([string]$assetRef.fetch_mode -eq 'local-video') {
+            $localVideoPath = Resolve-LocalVideoFilePath -Link $assetLink -VideoRoot $VideoMp4Root
+            if (-not $localVideoPath) {
+                continue
+            }
 
-                $download = Get-AssetBytesWithBrowser -Session $assetSession -Url $imgUrl -Referrer $snapshotLocation
-                $bytes = [byte[]]$download.Bytes
-                $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $imgUrl -ResponseContentType ([string]$download.ContentType)
+            try {
+                $bytes = [System.IO.File]::ReadAllBytes($localVideoPath)
+                $contentType = if ($assetRef.content_type) { [string]$assetRef.content_type } else { 'video/mp4' }
                 $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
                 $sha256 = Get-Sha256Hex -Bytes $bytes
                 $size = [Int64]$bytes.LongLength
@@ -1364,32 +1658,84 @@ foreach ($file in $files) {
                 }
 
                 $imgRow = [pscustomobject]@{
-                    link = $imgUrl
+                    link = $assetLink
                     path = $relativePath
                     type = $contentType
                     encoding = $manifestEncoding
                     sha256 = $sha256
                     size_bytes = $size
                 }
-                $urlToRow[$imgUrl] = $imgRow
-                $seenRows[$imgUrl] = $true
+                $urlToRow[$assetLink] = $imgRow
+                $seenRows[$assetLink] = $true
+                $rows.Add($imgRow) | Out-Null
+                $stats.LinkedLocalVideoUrls++
+            }
+            catch {
+                Write-Warning "Gagal proses video lokal: $assetLink - $($_.Exception.Message)"
+                continue
+            }
+        }
+        else {
+            try {
+                $assetSocket = Get-AssetSessionSocket -Session $assetSession
+                if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                    if ($assetSession) {
+                        Close-AssetDownloadSession -Session $assetSession
+                    }
+                    $assetSession = New-AssetDownloadSession
+                }
+
+                $download = Get-AssetBytesWithBrowser -Session $assetSession -Url $assetLink -Referrer $snapshotLocation
+                $bytes = [byte[]]$download.Bytes
+                $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $assetLink -ResponseContentType ([string]$download.ContentType)
+                $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
+                $sha256 = Get-Sha256Hex -Bytes $bytes
+                $size = [Int64]$bytes.LongLength
+                $contentKey = "$sha256`t$size"
+
+                if ($hashToPath.ContainsKey($contentKey)) {
+                    $relativePath = $hashToPath[$contentKey]
+                    $stats.ReusedFiles++
+                }
+                else {
+                    do {
+                        $uuid = New-UuidV7
+                        $relativePath = Get-RelativeAssetPath -Uuid $uuid
+                        $fullPath = ConvertTo-FullPath -RelativePath $relativePath
+                    } while (Test-Path -LiteralPath $fullPath)
+
+                    [System.IO.File]::WriteAllBytes($fullPath, $bytes)
+                    $hashToPath[$contentKey] = $relativePath
+                    $stats.WrittenFiles++
+                }
+
+                $imgRow = [pscustomobject]@{
+                    link = $assetLink
+                    path = $relativePath
+                    type = $contentType
+                    encoding = $manifestEncoding
+                    sha256 = $sha256
+                    size_bytes = $size
+                }
+                $urlToRow[$assetLink] = $imgRow
+                $seenRows[$assetLink] = $true
                 $rows.Add($imgRow) | Out-Null
                 $stats.DownloadedImgUrls++
             }
             catch {
                 $stats.FailedImgUrls++
-                Write-Warning "Gagal download img tanpa multipart: $imgUrl - $($_.Exception.Message)"
+                Write-Warning "Gagal download asset tanpa multipart: $assetLink - $($_.Exception.Message)"
                 continue
             }
         }
 
         if ($imgRow) {
             $missingImgParts.Add([pscustomobject]@{
-                link = $imgUrl
+                link = $assetLink
                 content_type = $contentType
                 encoding = if ($imgRow -and $imgRow.encoding) { [string]$imgRow.encoding } else { Get-PreferredManifestEncoding -ContentType $contentType }
             }) | Out-Null
-            $filePartLocations[$imgUrl] = $true
+            $filePartLocations[$assetLink] = $true
         }
     }
 
@@ -1437,10 +1783,11 @@ Write-Host "Files written        : $($stats.WrittenFiles)"
 Write-Host "Files reused         : $($stats.ReusedFiles)"
 Write-Host "Part bodies cleared  : $($stats.ClearedPartBodies)"
 Write-Host "Stripped MHTML files : $($stats.StrippedMhtmlFiles)"
-Write-Host "Missing img URLs     : $($stats.MissingImgUrls)"
-Write-Host "Downloaded img URLs  : $($stats.DownloadedImgUrls)"
-Write-Host "Failed img URLs      : $($stats.FailedImgUrls)"
-Write-Host "Added img parts      : $($stats.AddedMissingImgParts)"
+Write-Host "Missing asset refs   : $($stats.MissingImgUrls)"
+Write-Host "Downloaded assets    : $($stats.DownloadedImgUrls)"
+Write-Host "Linked local videos  : $($stats.LinkedLocalVideoUrls)"
+Write-Host "Failed asset URLs    : $($stats.FailedImgUrls)"
+Write-Host "Added asset parts    : $($stats.AddedMissingImgParts)"
 Write-Host "Skipped existing URL : $($stats.SkippedExistingUrls)"
 Write-Host "Skipped snapshot URL : $($stats.SkippedSnapshotParts)"
 Write-Host "Skipped non-HTTPS    : $($stats.SkippedNonHttpsParts)"
