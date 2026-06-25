@@ -196,6 +196,20 @@ function ConvertTo-MimeBody {
     }
 }
 
+function Normalize-StoredEncoding {
+    param([string]$Encoding)
+
+    if ([string]::IsNullOrWhiteSpace($Encoding)) {
+        return ''
+    }
+
+    if ($Encoding.Trim().ToLowerInvariant() -eq 'quoted-printable') {
+        return '8bit'
+    }
+
+    return $Encoding.Trim()
+}
+
 function Update-OrAddHeader {
     param(
         [string]$HeaderText,
@@ -249,7 +263,19 @@ function Import-AssetMap {
         }
 
         if (-not $map.ContainsKey($row.link)) {
-            $map[$row.link] = $row
+            $normalizedEncoding = Normalize-StoredEncoding -Encoding ([string]$row.encoding)
+            $copy = [pscustomobject]@{}
+            foreach ($property in $row.PSObject.Properties) {
+                $copy | Add-Member -NotePropertyName $property.Name -NotePropertyValue $property.Value
+            }
+            if ($copy.PSObject.Properties.Match('encoding').Count -gt 0) {
+                $copy.encoding = $normalizedEncoding
+            }
+            else {
+                $copy | Add-Member -NotePropertyName 'encoding' -NotePropertyValue $normalizedEncoding
+            }
+
+            $map[$row.link] = $copy
         }
     }
 
@@ -318,7 +344,7 @@ function Restore-MhtmlBodies {
             continue
         }
 
-        $encoding = if ($row.encoding) { [string]$row.encoding } else { 'base64' }
+        $encoding = if ($row.encoding) { Normalize-StoredEncoding -Encoding ([string]$row.encoding) } else { 'base64' }
         if (-not $encoding) {
             $encoding = 'base64'
         }
@@ -396,7 +422,10 @@ function Write-BodyFromAssetFile {
     )
 
     $bytes = [System.IO.File]::ReadAllBytes($AssetPath)
-    $effectiveEncoding = if ($Encoding) { $Encoding } else { 'base64' }
+    $effectiveEncoding = if ($Encoding) { Normalize-StoredEncoding -Encoding $Encoding } else { 'base64' }
+    if (-not $effectiveEncoding) {
+        $effectiveEncoding = 'base64'
+    }
     Write-MimeBody -Writer $Writer -Bytes $bytes -Encoding $effectiveEncoding
 }
 
@@ -571,7 +600,7 @@ function Write-RestoredMhtmlStream {
                 continue
             }
 
-            $encoding = if ($row.encoding) { [string]$row.encoding } else { 'base64' }
+            $encoding = if ($row.encoding) { Normalize-StoredEncoding -Encoding ([string]$row.encoding) } else { 'base64' }
             if (-not $encoding) {
                 $encoding = 'base64'
             }

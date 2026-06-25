@@ -496,10 +496,24 @@ function Get-PreferredManifestEncoding {
     param([string]$ContentType)
 
     if ($ContentType -match '(?i)(^image/svg\+xml\b|\+xml\b|^text/|javascript|json|css)') {
-        return 'quoted-printable'
+        return '8bit'
     }
 
     return 'base64'
+}
+
+function Normalize-StoredEncoding {
+    param([string]$Encoding)
+
+    if ([string]::IsNullOrWhiteSpace($Encoding)) {
+        return ''
+    }
+
+    if ($Encoding.Trim().ToLowerInvariant() -eq 'quoted-printable') {
+        return '8bit'
+    }
+
+    return $Encoding.Trim()
 }
 
 function Get-ContentTypeForManifestRow {
@@ -1460,7 +1474,7 @@ function Import-ExistingUrlMap {
                 link = $row.link
                 path = $row.path
                 type = if (Test-ObjectProperty -Object $row -Name 'type') { $row.type } else { '' }
-                encoding = $row.encoding
+                encoding = Normalize-StoredEncoding -Encoding ([string]$row.encoding)
                 sha256 = $row.sha256
                 size_bytes = $row.size_bytes
             }
@@ -1560,6 +1574,10 @@ foreach ($file in $files) {
         if (-not $partContentType) {
             $partContentType = 'application/octet-stream'
         }
+        $storedEncoding = Normalize-StoredEncoding -Encoding $transferEncoding
+        if (-not $storedEncoding) {
+            $storedEncoding = $transferEncoding
+        }
 
         if ([string]::IsNullOrEmpty($part.Body)) {
             Write-Warning "Body kosong dan URL belum ada di manifest, skip: $location"
@@ -1608,7 +1626,7 @@ foreach ($file in $files) {
             link = $location
             path = $relativePath
             type = $partContentType
-            encoding = $transferEncoding
+            encoding = $storedEncoding
             sha256 = $sha256
             size_bytes = $size
         }
@@ -1743,7 +1761,7 @@ foreach ($file in $files) {
             $missingImgParts.Add([pscustomobject]@{
                 link = $assetLink
                 content_type = $contentType
-                encoding = if ($imgRow -and $imgRow.encoding) { [string]$imgRow.encoding } else { Get-PreferredManifestEncoding -ContentType $contentType }
+                encoding = if ($imgRow -and $imgRow.encoding) { Normalize-StoredEncoding -Encoding ([string]$imgRow.encoding) } else { Get-PreferredManifestEncoding -ContentType $contentType }
             }) | Out-Null
             $filePartLocations[$assetLink] = $true
         }
