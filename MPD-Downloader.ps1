@@ -1,7 +1,8 @@
 param(
     [string]$Root = $PSScriptRoot,
     [int]$BrowserPollSeconds = 0.5,
-    [int]$ParallelDownloads = 6
+    [int]$ParallelDownloads = 6,
+    [int]$DownloadRetries = 100000
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +10,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $Root = (Resolve-Path -LiteralPath $Root).Path
 $ParallelDownloads = [Math]::Max(1, $ParallelDownloads)
+$DownloadRetries = [Math]::Max(0, $DownloadRetries)
 $VideoDir = Join-Path $Root 'video'
 $HtmlDir = Join-Path $VideoDir 'embed'
 $MpdDir = Join-Path $VideoDir 'mpd'
@@ -654,7 +656,8 @@ function Start-DownloadJob {
 function Invoke-ParallelDownloads {
     param(
         [object[]]$Tasks,
-        [int]$MaxParallel
+        [int]$MaxParallel,
+        [int]$RetryLimit
     )
 
     if (-not $Tasks -or $Tasks.Count -eq 0) {
@@ -678,6 +681,10 @@ function Invoke-ParallelDownloads {
             $task = $Tasks[$nextIndex]
             $nextIndex++
 
+            if (-not $task.PSObject.Properties['RetryCount']) {
+                $task | Add-Member -NotePropertyName RetryCount -NotePropertyValue 0 -Force
+            }
+
             if (Test-Path -LiteralPath $task.Mp4Path) {
                 Write-Host "Skipping MP4: $(Split-Path -Leaf $task.Mp4Path) already exists"
                 continue
@@ -688,7 +695,9 @@ function Invoke-ParallelDownloads {
                 continue
             }
 
-            Write-Host "Starting MP4: $(Split-Path -Leaf $task.Mp4Path)"
+            $attempt = [int]$task.RetryCount + 1
+            $totalAttempts = $RetryLimit + 1
+            Write-Host "Starting MP4: $(Split-Path -Leaf $task.Mp4Path) (attempt $attempt/$totalAttempts)"
             $job = Start-DownloadJob -YtDlpPath $ytDlp.Source -Kind $task.Kind -MpdPath $task.MpdPath -SourceUrl $task.SourceUrl -Mp4Path $task.Mp4Path
             $running += [pscustomobject]@{
                 Job = $job
@@ -710,10 +719,30 @@ function Invoke-ParallelDownloads {
         }
 
         if ($completedJob.State -eq 'Failed') {
-            Write-Warning "Download failed: $(Split-Path -Leaf $completedTask.Mp4Path)"
+            if ((Test-Path -LiteralPath $completedTask.Mp4Path) -and (Get-Item -LiteralPath $completedTask.Mp4Path).Length -gt 0) {
+                Write-Host "Finished MP4 despite warning: $(Split-Path -Leaf $completedTask.Mp4Path)"
+            }
+            elseif ([int]$completedTask.RetryCount -lt $RetryLimit) {
+                $completedTask.RetryCount = [int]$completedTask.RetryCount + 1
+                Write-Warning "Download failed, retrying: $(Split-Path -Leaf $completedTask.Mp4Path) (retry $($completedTask.RetryCount)/$RetryLimit)"
+                $Tasks += $completedTask
+            }
+            else {
+                Write-Warning "Download failed after $($RetryLimit + 1) attempt(s): $(Split-Path -Leaf $completedTask.Mp4Path)"
+            }
         }
         else {
-            Write-Host "Finished MP4: $(Split-Path -Leaf $completedTask.Mp4Path)"
+            if ((Test-Path -LiteralPath $completedTask.Mp4Path) -and (Get-Item -LiteralPath $completedTask.Mp4Path).Length -gt 0) {
+                Write-Host "Finished MP4: $(Split-Path -Leaf $completedTask.Mp4Path)"
+            }
+            elseif ([int]$completedTask.RetryCount -lt $RetryLimit) {
+                $completedTask.RetryCount = [int]$completedTask.RetryCount + 1
+                Write-Warning "MP4 output missing, retrying: $(Split-Path -Leaf $completedTask.Mp4Path) (retry $($completedTask.RetryCount)/$RetryLimit)"
+                $Tasks += $completedTask
+            }
+            else {
+                Write-Warning "MP4 output missing after $($RetryLimit + 1) attempt(s): $(Split-Path -Leaf $completedTask.Mp4Path)"
+            }
         }
 
         Remove-Job -Job $completedJob
@@ -847,7 +876,7 @@ foreach ($mhtmlFile in $mhtmlFiles) {
     }
 }
 
-Invoke-ParallelDownloads -Tasks $downloadTasks -MaxParallel $ParallelDownloads
+Invoke-ParallelDownloads -Tasks $downloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries
 
 foreach ($entry in $listEntries) {
     Add-MpdListEntry -MhtmlPath $entry.MhtmlPath -EmbedUrl $entry.EmbedUrl -Mp4Path $entry.Mp4Path

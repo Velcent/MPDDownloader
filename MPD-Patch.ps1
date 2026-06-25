@@ -26,6 +26,23 @@ function Convert-FileUriToPath {
     return Join-Path $Root $Value
 }
 
+function Test-InMhtmlFolder {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath((Convert-FileUriToPath $Path))
+        $mhtmlRoot = [System.IO.Path]::GetFullPath((Join-Path $Root 'mhtml')).TrimEnd('\') + '\'
+        return $fullPath.StartsWith($mhtmlRoot, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-VideoIdFromEmbedUrl {
     param([string]$Url)
 
@@ -318,7 +335,7 @@ function Patch-EmbedPart {
 }
 
 $rows = Import-Csv -LiteralPath $ListPath -Delimiter "`t" | Where-Object {
-    $_.mhtml_file -and $_.embed_html -and (Get-VideoPatchInfo $_.embed_html)
+    $_.mhtml_file -and $_.embed_html -and (Test-InMhtmlFolder $_.mhtml_file) -and (Get-VideoPatchInfo $_.embed_html)
 }
 
 if (-not $rows) {
