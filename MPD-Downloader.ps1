@@ -617,6 +617,18 @@ function Add-MpdListEntry {
     $sizeText = Get-VideoSizeText $Mp4Path
     $line = "$mhtmlLink`t$EmbedUrl`t$sizeText"
     Add-Content -LiteralPath $ListPath -Value $line -Encoding UTF8
+    Sync-ListBackup -Path $ListPath
+}
+
+function Sync-ListBackup {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $backupPath = "$Path.bak"
+    [System.IO.File]::Copy($Path, $backupPath, $true)
 }
 
 function Start-DownloadJob {
@@ -752,20 +764,20 @@ function Invoke-ParallelDownloads {
 
 $listHeader = "mhtml_file`tembed_html`tvideo_size"
 Set-Content -LiteralPath $ListPath -Value $listHeader -Encoding UTF8
+Sync-ListBackup -Path $ListPath
 $downloadTasks = @()
 $listEntries = @()
 $queuedMp4Paths = @{}
+$mhtmlRoot = Join-Path $Root 'mhtml'
 
-$excludedScanDirs = @($VideoDir) | ForEach-Object {
-    (Resolve-Path -LiteralPath $_).Path.TrimEnd('\') + '\'
+if (-not (Test-Path -LiteralPath $mhtmlRoot)) {
+    Write-Host "MHTML folder not found: $mhtmlRoot"
+    exit 0
 }
 
-$mhtmlFiles = Get-ChildItem -LiteralPath $Root -Filter '*.mhtml' -File -Recurse | Where-Object {
-    $fullName = $_.FullName
-    -not ($excludedScanDirs | Where-Object { $fullName.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) })
-}
+$mhtmlFiles = Get-ChildItem -LiteralPath $mhtmlRoot -Filter '*.mhtml' -File -Recurse
 if (-not $mhtmlFiles) {
-    Write-Host "No .mhtml files found in $Root"
+    Write-Host "No .mhtml files found in $mhtmlRoot"
     exit 0
 }
 

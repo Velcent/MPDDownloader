@@ -17,6 +17,7 @@ $ProgressPreference = 'SilentlyContinue'
 $ImageDownloadAttempts = [Math]::Max(1, $ImageDownloadAttempts)
 $BrowserReadyTimeoutSeconds = [Math]::Max(5, $BrowserReadyTimeoutSeconds)
 $script:BrowserPort = $null
+$script:BrowserProcessId = $null
 $script:CdpCommandId = 0
 
 if (-not $InputPath) {
@@ -1087,20 +1088,68 @@ function Ensure-Edge {
             'about:blank'
         )
 
-        Start-Process -FilePath $edgePath -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+        $process = Start-Process -FilePath $edgePath -ArgumentList $arguments -WindowStyle Hidden -PassThru
 
         try {
             Wait-DevTools -Port $script:BrowserPort
             $script:BrowserProfileDir = $profileDir
+            $script:BrowserProcessId = $process.Id
             return
         }
         catch {
             Write-Warning $_.Exception.Message
             $script:BrowserPort = $null
+            if ($process -and -not $process.HasExited) {
+                try {
+                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                }
+                catch {
+                }
+            }
         }
     }
 
     throw 'Edge DevTools gagal dimulai.'
+}
+
+function Close-EdgeBrowser {
+    if (-not $script:BrowserProcessId) {
+        $script:BrowserPort = $null
+        return
+    }
+
+    try {
+        $toStop = New-Object System.Collections.Generic.List[int]
+        $visited = New-Object 'System.Collections.Generic.Dictionary[int,bool]'
+        $queue = New-Object System.Collections.Generic.Queue[int]
+        $queue.Enqueue([int]$script:BrowserProcessId)
+
+        while ($queue.Count -gt 0) {
+            $currentId = $queue.Dequeue()
+            if ($visited.ContainsKey($currentId)) {
+                continue
+            }
+
+            $visited[$currentId] = $true
+            $toStop.Add($currentId) | Out-Null
+
+            foreach ($child in @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $currentId" -ErrorAction SilentlyContinue)) {
+                $queue.Enqueue([int]$child.ProcessId)
+            }
+        }
+
+        foreach ($pid in ($toStop | Sort-Object -Descending)) {
+            try {
+                Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+            }
+            catch {
+            }
+        }
+    }
+    finally {
+        $script:BrowserProcessId = $null
+        $script:BrowserPort = $null
+    }
 }
 
 function Open-DevToolsUrl {
@@ -1800,6 +1849,7 @@ foreach ($file in $files) {
 }
 
 Close-AssetDownloadSession -Session $assetSession
+Close-EdgeBrowser
 
 $tsvLines = New-Object System.Collections.Generic.List[string]
 $tsvLines.Add("link`tpath`ttype`tencoding`tsha256`tsize_bytes") | Out-Null
