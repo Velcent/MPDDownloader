@@ -202,11 +202,11 @@ function Get-VideoPlayerHtml {
         [string]$PosterUrl
     )
 
-    $mp4Source = "$(ConvertTo-HtmlAttributeValue "$VideoId.mp4")"
-    $posterAttribute = ''
+    $mp4Link = "https://media.local/assets/video/$VideoId.mp4"
+    $posterCss = 'none'
 
     if (-not [string]::IsNullOrWhiteSpace($PosterUrl)) {
-        $posterAttribute = " poster=""$(ConvertTo-HtmlAttributeValue $PosterUrl)"""
+        $posterCss = 'url("' + (ConvertTo-CssUrlValue $PosterUrl) + '")'
     }
 
     return @"
@@ -222,17 +222,56 @@ html, body {
   background: #000;
 }
 
-.video-player {
+.video-link {
+  position: relative;
   width: 100%;
   height: 100%;
-  display: block;
-  object-fit: contain;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   background: #000;
+  background-image: $posterCss;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: contain;
+  text-decoration: none;
+}
+
+.video-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.35));
+}
+
+.play {
+  position: relative;
+  z-index: 1;
+  width: 72px;
+  height: 72px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.68);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18) inset;
+}
+
+.play::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-38%, -50%);
+  width: 0;
+  height: 0;
+  border-top: 14px solid transparent;
+  border-bottom: 14px solid transparent;
+  border-left: 22px solid #fff;
 }
 </style>
 </head>
 <body>
-<video class="video-player" src="$mp4Source"$posterAttribute controls preload="metadata"></video>
+<a class="video-link" href="$(ConvertTo-HtmlAttributeValue $mp4Link)">
+  <span class="play"></span>
+</a>
 </body>
 </html>
 "@

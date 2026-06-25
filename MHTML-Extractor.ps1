@@ -36,6 +36,7 @@ if (-not $TsvPath) {
 }
 
 $BinRoot = Join-Path $AssetsRoot 'bin'
+$AssetsVideoRoot = Join-Path $AssetsRoot 'video'
 $VideoMp4Root = Join-Path $PSScriptRoot 'video\mp4'
 $ScriptRootFull = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $script:BrowserProfileDir = Join-Path $AssetsRoot '.edge-profile'
@@ -812,6 +813,42 @@ function Get-AssetReferencesFromHtml {
     }
 
     try {
+        foreach ($anchor in [regex]::Matches($Html, '(?is)<a\b(?<attrs>[^>]*)>')) {
+            $attrs = $anchor.Groups['attrs'].Value
+            $classMatch = [regex]::Match($attrs, '(?is)\bclass\s*=\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)''|(?<bare>[^\s>]+))')
+            $classValue = ''
+            foreach ($name in @('dq', 'sq', 'bare')) {
+                if ($classMatch.Success -and $classMatch.Groups[$name].Success) {
+                    $classValue = $classMatch.Groups[$name].Value
+                    break
+                }
+            }
+
+            foreach ($attr in [regex]::Matches($attrs, '(?is)\bhref\s*=\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)''|(?<bare>[^\s>]+))')) {
+                foreach ($name in @('dq', 'sq', 'bare')) {
+                    if ($attr.Groups[$name].Success) {
+                        $link = Resolve-AssetLink -RawUrl $attr.Groups[$name].Value -BaseUrl $BaseUrl -AllowRelative
+                        if (
+                            $link -and
+                            (
+                                $classValue -match '(^|\s)video-link(\s|$)' -or
+                                $link -match '(?i)^https://media\.local/(?:assets/video|video/mp4)/.+\.mp4(?:$|[?#])' -or
+                                $link -match '(?i)(?:^|/)[^/]+\.mp4(?:$|[?#])'
+                            )
+                        ) {
+                            Add-AssetReference -Results $results -Seen $seen -Link $link -FetchMode 'local-video' -ContentType 'video/mp4'
+                        }
+                        break
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        throw "Get-AssetReferencesFromHtml/anchor-video: $($_.Exception.Message)"
+    }
+
+    try {
         foreach ($styleBlock in [regex]::Matches($Html, '(?is)<style\b[^>]*>(?<css>.*?)</style>')) {
             foreach ($cssUrl in Get-HttpsBackgroundUrlsFromCss -CssText $styleBlock.Groups['css'].Value -BaseUrl $BaseUrl) {
                 Add-AssetReference -Results $results -Seen $seen -Link $cssUrl -FetchMode 'browser'
@@ -1485,6 +1522,7 @@ function Import-ExistingUrlMap {
 }
 
 New-Item -ItemType Directory -Force -Path $BinRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $AssetsVideoRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $StrippedMhtmlRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TsvPath) | Out-Null
 
@@ -1646,7 +1684,37 @@ foreach ($file in $files) {
         $imgRow = $null
         $contentType = ''
 
-        if ($urlToRow.ContainsKey($assetLink)) {
+        if ([string]$assetRef.fetch_mode -eq 'local-video') {
+            $localVideoPath = Resolve-LocalVideoFilePath -Link $assetLink -VideoRoot $VideoMp4Root
+            if (-not $localVideoPath) {
+                continue
+            }
+
+            try {
+                $targetName = [System.IO.Path]::GetFileName($localVideoPath)
+                $targetPath = Join-Path $AssetsVideoRoot $targetName
+                $shouldCopy = $true
+
+                if (Test-Path -LiteralPath $targetPath) {
+                    $sourceInfo = Get-Item -LiteralPath $localVideoPath
+                    $targetInfo = Get-Item -LiteralPath $targetPath
+                    if ($sourceInfo.Length -eq $targetInfo.Length) {
+                        $shouldCopy = $false
+                    }
+                }
+
+                if ($shouldCopy) {
+                    Copy-Item -LiteralPath $localVideoPath -Destination $targetPath -Force
+                }
+
+                $stats.LinkedLocalVideoUrls++
+            }
+            catch {
+                Write-Warning "Gagal proses video lokal: $assetLink - $($_.Exception.Message)"
+                continue
+            }
+        }
+        elseif ($urlToRow.ContainsKey($assetLink)) {
             $imgRow = $urlToRow[$assetLink]
             $contentType = Get-ContentTypeForManifestRow -Row $imgRow
             if (-not $seenRows.ContainsKey($assetLink)) {
@@ -1654,54 +1722,6 @@ foreach ($file in $files) {
                 $rows.Add($imgRow) | Out-Null
             }
             $stats.SkippedExistingUrls++
-        }
-        elseif ([string]$assetRef.fetch_mode -eq 'local-video') {
-            $localVideoPath = Resolve-LocalVideoFilePath -Link $assetLink -VideoRoot $VideoMp4Root
-            if (-not $localVideoPath) {
-                continue
-            }
-
-            try {
-                $bytes = [System.IO.File]::ReadAllBytes($localVideoPath)
-                $contentType = if ($assetRef.content_type) { [string]$assetRef.content_type } else { 'video/mp4' }
-                $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
-                $sha256 = Get-Sha256Hex -Bytes $bytes
-                $size = [Int64]$bytes.LongLength
-                $contentKey = "$sha256`t$size"
-
-                if ($hashToPath.ContainsKey($contentKey)) {
-                    $relativePath = $hashToPath[$contentKey]
-                    $stats.ReusedFiles++
-                }
-                else {
-                    do {
-                        $uuid = New-UuidV7
-                        $relativePath = Get-RelativeAssetPath -Uuid $uuid
-                        $fullPath = ConvertTo-FullPath -RelativePath $relativePath
-                    } while (Test-Path -LiteralPath $fullPath)
-
-                    [System.IO.File]::WriteAllBytes($fullPath, $bytes)
-                    $hashToPath[$contentKey] = $relativePath
-                    $stats.WrittenFiles++
-                }
-
-                $imgRow = [pscustomobject]@{
-                    link = $assetLink
-                    path = $relativePath
-                    type = $contentType
-                    encoding = $manifestEncoding
-                    sha256 = $sha256
-                    size_bytes = $size
-                }
-                $urlToRow[$assetLink] = $imgRow
-                $seenRows[$assetLink] = $true
-                $rows.Add($imgRow) | Out-Null
-                $stats.LinkedLocalVideoUrls++
-            }
-            catch {
-                Write-Warning "Gagal proses video lokal: $assetLink - $($_.Exception.Message)"
-                continue
-            }
         }
         else {
             try {
@@ -1801,6 +1821,10 @@ foreach ($row in ($rows | Sort-Object link, path)) {
     ) -join "`t") | Out-Null
 }
 
+if (Test-Path -LiteralPath $TsvPath) {
+    Copy-Item -LiteralPath $TsvPath -Destination ($TsvPath + '.bak') -Force
+}
+
 [System.IO.File]::WriteAllLines($TsvPath, $tsvLines, $Utf8NoBom)
 
 Write-Host ''
@@ -1822,5 +1846,6 @@ Write-Host "Skipped snapshot URL : $($stats.SkippedSnapshotParts)"
 Write-Host "Skipped non-HTTPS    : $($stats.SkippedNonHttpsParts)"
 Write-Host "Manifest             : $TsvPath"
 Write-Host "Asset folder         : $BinRoot"
+Write-Host "Video folder         : $AssetsVideoRoot"
 Write-Host "Stripped MHTML folder: $StrippedMhtmlRoot"
 pause
