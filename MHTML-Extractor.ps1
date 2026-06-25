@@ -491,6 +491,16 @@ function Test-ImageBytesComplete {
     return ''
 }
 
+function Get-PreferredManifestEncoding {
+    param([string]$ContentType)
+
+    if ($ContentType -match '(?i)(^image/svg\+xml\b|\+xml\b|^text/|javascript|json|css)') {
+        return 'quoted-printable'
+    }
+
+    return 'base64'
+}
+
 function Get-ContentTypeForManifestRow {
     param($Row)
 
@@ -1332,6 +1342,7 @@ foreach ($file in $files) {
                 $download = Get-AssetBytesWithBrowser -Session $assetSession -Url $imgUrl -Referrer $snapshotLocation
                 $bytes = [byte[]]$download.Bytes
                 $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $imgUrl -ResponseContentType ([string]$download.ContentType)
+                $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
                 $sha256 = Get-Sha256Hex -Bytes $bytes
                 $size = [Int64]$bytes.LongLength
                 $contentKey = "$sha256`t$size"
@@ -1356,7 +1367,7 @@ foreach ($file in $files) {
                     link = $imgUrl
                     path = $relativePath
                     type = $contentType
-                    encoding = 'base64'
+                    encoding = $manifestEncoding
                     sha256 = $sha256
                     size_bytes = $size
                 }
@@ -1376,7 +1387,7 @@ foreach ($file in $files) {
             $missingImgParts.Add([pscustomobject]@{
                 link = $imgUrl
                 content_type = $contentType
-                encoding = 'base64'
+                encoding = if ($imgRow -and $imgRow.encoding) { [string]$imgRow.encoding } else { Get-PreferredManifestEncoding -ContentType $contentType }
             }) | Out-Null
             $filePartLocations[$imgUrl] = $true
         }
