@@ -15,9 +15,10 @@ $VideoDir = Join-Path $Root 'video'
 $HtmlDir = Join-Path $VideoDir 'embed'
 $MpdDir = Join-Path $VideoDir 'mpd'
 $Mp4Dir = Join-Path $VideoDir 'mp4'
+$OldMp4Dir = Join-Path $VideoDir 'old'
 $ListPath = Join-Path $VideoDir 'mpd-list.tsv'
 
-New-Item -ItemType Directory -Force -Path $VideoDir, $HtmlDir, $MpdDir, $Mp4Dir | Out-Null
+New-Item -ItemType Directory -Force -Path $VideoDir, $HtmlDir, $MpdDir, $Mp4Dir, $OldMp4Dir | Out-Null
 
 $script:BrowserPort = $null
 $script:BrowserProfileDir = Join-Path $HtmlDir '.browser-profile'
@@ -606,6 +607,29 @@ function Get-VideoSizeText {
     return Format-FileSize $file.Length
 }
 
+function Restore-Mp4FromOld {
+    param([string]$Mp4Path)
+
+    if (Test-Path -LiteralPath $Mp4Path) {
+        return $true
+    }
+
+    $oldPath = Join-Path $OldMp4Dir (Split-Path -Leaf $Mp4Path)
+    if (-not (Test-Path -LiteralPath $oldPath)) {
+        return $false
+    }
+
+    try {
+        Move-Item -LiteralPath $oldPath -Destination $Mp4Path
+        Write-Host "Moved MP4 from old: $(Split-Path -Leaf $Mp4Path)"
+        return $true
+    }
+    catch {
+        Write-Warning "Cannot move MP4 from old: $(Split-Path -Leaf $Mp4Path). $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Add-MpdListEntry {
     param(
         [string]$MhtmlPath,
@@ -720,7 +744,7 @@ function Invoke-ParallelDownloads {
                 $task | Add-Member -NotePropertyName RetryCount -NotePropertyValue 0 -Force
             }
 
-            if (Test-Path -LiteralPath $task.Mp4Path) {
+            if (Restore-Mp4FromOld -Mp4Path $task.Mp4Path) {
                 Write-Host "Skipping MP4: $(Split-Path -Leaf $task.Mp4Path) already exists"
                 continue
             }
@@ -832,6 +856,7 @@ foreach ($mhtmlFile in $mhtmlFiles) {
         }
 
         $mp4Path = Join-Path $Mp4Dir "$youtubeId.mp4"
+        [void](Restore-Mp4FromOld -Mp4Path $mp4Path)
 
         Write-Host ""
         Write-Host "YouTube: $youtubeId"
@@ -868,6 +893,7 @@ foreach ($mhtmlFile in $mhtmlFiles) {
         $mpdPath = Join-Path $MpdDir "$videoId.mpd"
         $mp4Path = Join-Path $Mp4Dir "$videoId.mp4"
         $htmlPath = Join-Path $HtmlDir "$videoId.html"
+        [void](Restore-Mp4FromOld -Mp4Path $mp4Path)
 
         Write-Host ""
         Write-Host "Video: $videoId"
