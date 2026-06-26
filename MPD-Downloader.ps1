@@ -138,6 +138,38 @@ function Get-YoutubeEmbedUrlsFromMhtml {
     }
 }
 
+function Get-LocalMp4UrlsFromMhtml {
+    param([string]$MhtmlText)
+
+    $searchText = [System.Net.WebUtility]::HtmlDecode((Convert-QuotedPrintableText $MhtmlText)).Replace('\/', '/')
+    $pattern = 'https://media\.local/assets/video/[^"''<>\s\\)]+\.mp4'
+    $seen = @{}
+
+    foreach ($match in [regex]::Matches($searchText, $pattern, 'IgnoreCase')) {
+        $url = $match.Value
+        if (-not $seen.ContainsKey($url)) {
+            $seen[$url] = $true
+            $url
+        }
+    }
+}
+
+function Get-LocalMp4VideoIdFromUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return $null
+    }
+
+    $decoded = [System.Net.WebUtility]::HtmlDecode($Url).Replace('\/', '/')
+    $match = [regex]::Match($decoded, 'https://media\.local/assets/video/(?<id>[^/"''<>\s\\)]+)\.mp4', 'IgnoreCase')
+    if ($match.Success) {
+        return $match.Groups['id'].Value
+    }
+
+    return $null
+}
+
 function Get-RemoteText {
     param([string]$Url)
 
@@ -843,9 +875,32 @@ foreach ($mhtmlFile in $mhtmlFiles) {
     $mhtmlText = Get-Content -LiteralPath $mhtmlFile.FullName -Raw
     $embedUrls = @(Get-EmbedUrlsFromMhtml $mhtmlText)
     $youtubeUrls = @(Get-YoutubeEmbedUrlsFromMhtml $mhtmlText)
+    $localMp4Urls = @(Get-LocalMp4UrlsFromMhtml $mhtmlText)
+    $localVideoIds = @{}
 
-    if (-not $embedUrls -and -not $youtubeUrls) {
-        Write-Host 'No Epic or YouTube embed URLs found.'
+    foreach ($localMp4Url in $localMp4Urls) {
+        $localVideoId = Get-LocalMp4VideoIdFromUrl $localMp4Url
+        if (-not $localVideoId) {
+            continue
+        }
+
+        $localVideoIds[$localVideoId] = $true
+        $mp4Path = Join-Path $Mp4Dir "$localVideoId.mp4"
+        [void](Restore-Mp4FromOld -Mp4Path $mp4Path)
+
+        if (-not (Test-Path -LiteralPath $mp4Path)) {
+            Write-Warning "Local MP4 referenced but not found: $localVideoId.mp4"
+        }
+
+        $listEntries += [pscustomobject]@{
+            MhtmlPath = $mhtmlFile.FullName
+            EmbedUrl = $localMp4Url
+            Mp4Path = $mp4Path
+        }
+    }
+
+    if (-not $embedUrls -and -not $youtubeUrls -and -not $localMp4Urls) {
+        Write-Host 'No Epic, YouTube, or local MP4 URLs found.'
         continue
     }
 
@@ -860,6 +915,11 @@ foreach ($mhtmlFile in $mhtmlFiles) {
 
         Write-Host ""
         Write-Host "YouTube: $youtubeId"
+
+        if ($localVideoIds.ContainsKey($youtubeId)) {
+            Write-Host "Skipping online download: local MP4 URL found for $youtubeId"
+            continue
+        }
 
         $mp4Key = $mp4Path.ToLowerInvariant()
         if (-not $queuedMp4Paths.ContainsKey($mp4Key)) {
@@ -897,6 +957,17 @@ foreach ($mhtmlFile in $mhtmlFiles) {
 
         Write-Host ""
         Write-Host "Video: $videoId"
+
+        if ($localVideoIds.ContainsKey($videoId)) {
+            Write-Host "Skipping online download: local MP4 URL found for $videoId"
+            $listEntries += [pscustomobject]@{
+                MhtmlPath = $mhtmlFile.FullName
+                EmbedUrl = $embedUrl
+                Mp4Path = $mp4Path
+            }
+            Close-OpenEmbedTabs
+            continue
+        }
 
         if (Test-Path -LiteralPath $mpdPath) {
             Write-Host "Skipping MPD: $videoId.mpd already exists"
