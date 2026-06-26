@@ -5,7 +5,10 @@ param(
     [string]$StrippedMhtmlRoot = '',
     [string]$TsvPath = '',
     [int]$ImageDownloadAttempts = 100000,
-    [int]$BrowserReadyTimeoutSeconds = 60
+    [int]$BrowserReadyTimeoutSeconds = 60,
+    [int]$FileParallelism = 1,
+    [int]$AssetParallelism = 1,
+    [switch]$OverwriteExistingOutput
 )
 
 Set-StrictMode -Version Latest
@@ -16,6 +19,8 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $ProgressPreference = 'SilentlyContinue'
 $ImageDownloadAttempts = [Math]::Max(1, $ImageDownloadAttempts)
 $BrowserReadyTimeoutSeconds = [Math]::Max(5, $BrowserReadyTimeoutSeconds)
+$FileParallelism = [Math]::Max(1, $FileParallelism)
+$AssetParallelism = [Math]::Max(1, $AssetParallelism)
 $script:BrowserPort = $null
 $script:BrowserProcessId = $null
 $script:CdpCommandId = 0
@@ -1689,12 +1694,490 @@ function Add-ManifestRow {
     }
 }
 
+function Add-SharedStat {
+    param(
+        [hashtable]$Shared,
+        [string]$Name,
+        [Int64]$Amount = 1
+    )
+
+    [System.Threading.Monitor]::Enter($Shared.Lock)
+    try {
+        if (-not $Shared.Stats.Contains($Name)) {
+            $Shared.Stats[$Name] = [Int64]0
+        }
+
+        $Shared.Stats[$Name] = [Int64]$Shared.Stats[$Name] + $Amount
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($Shared.Lock)
+    }
+}
+
+function Get-OutputMhtmlPath {
+    param(
+        [System.IO.FileInfo]$File,
+        [string]$InputBasePath,
+        [string]$OutputRoot
+    )
+
+    $relativeMhtmlPath = Get-RelativePathFromBase -BasePath $InputBasePath -FullPath $File.FullName
+    return (Join-Path $OutputRoot $relativeMhtmlPath)
+}
+
+function Get-ExistingManifestRowFromShared {
+    param(
+        [hashtable]$Shared,
+        [string]$Link,
+        [switch]$MarkSeen
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Link)) {
+        return $null
+    }
+
+    [System.Threading.Monitor]::Enter($Shared.Lock)
+    try {
+        if (-not $Shared.UrlToRow.ContainsKey($Link)) {
+            return $null
+        }
+
+        $row = $Shared.UrlToRow[$Link]
+        if ($MarkSeen) {
+            Add-ManifestRow -Row $row -UrlRows $Shared.UrlToRow -SeenRows $Shared.SeenRows -Rows $Shared.Rows -ManifestPath $Shared.TsvPath
+        }
+
+        return $row
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($Shared.Lock)
+    }
+}
+
+function Save-ManifestCacheFromShared {
+    param([hashtable]$Shared)
+
+    [System.Threading.Monitor]::Enter($Shared.Lock)
+    try {
+        Save-ManifestCache -UrlRows $Shared.UrlToRow -ManifestPath $Shared.TsvPath
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($Shared.Lock)
+    }
+}
+
+function Register-AssetBytesInShared {
+    param(
+        [hashtable]$Shared,
+        [string]$Link,
+        [byte[]]$Bytes,
+        [string]$ContentType,
+        [string]$Encoding
+    )
+
+    $sha256 = Get-Sha256Hex -Bytes $Bytes
+    $size = [Int64]$Bytes.LongLength
+    $contentKey = "$sha256`t$size"
+
+    [System.Threading.Monitor]::Enter($Shared.Lock)
+    try {
+        if ($Shared.UrlToRow.ContainsKey($Link)) {
+            $row = $Shared.UrlToRow[$Link]
+            Add-ManifestRow -Row $row -UrlRows $Shared.UrlToRow -SeenRows $Shared.SeenRows -Rows $Shared.Rows -ManifestPath $Shared.TsvPath
+            $Shared.Stats.SkippedExistingUrls = [Int64]$Shared.Stats.SkippedExistingUrls + 1
+            return $row
+        }
+
+        if ($Shared.HashToPath.ContainsKey($contentKey)) {
+            $relativePath = $Shared.HashToPath[$contentKey]
+            $Shared.Stats.ReusedFiles = [Int64]$Shared.Stats.ReusedFiles + 1
+        }
+        else {
+            do {
+                $uuid = New-UuidV7
+                $relativePath = Get-RelativeAssetPath -Uuid $uuid
+                $fullPath = ConvertTo-FullPath -RelativePath $relativePath
+            } while (Test-Path -LiteralPath $fullPath)
+
+            [System.IO.File]::WriteAllBytes($fullPath, $Bytes)
+            $Shared.HashToPath[$contentKey] = $relativePath
+            $Shared.Stats.WrittenFiles = [Int64]$Shared.Stats.WrittenFiles + 1
+        }
+
+        $row = [pscustomobject]@{
+            link = $Link
+            path = $relativePath
+            type = $ContentType
+            encoding = $Encoding
+            sha256 = $sha256
+            size_bytes = $size
+        }
+        Add-ManifestRow -Row $row -UrlRows $Shared.UrlToRow -SeenRows $Shared.SeenRows -Rows $Shared.Rows -ManifestPath $Shared.TsvPath -SaveNow
+        return $row
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($Shared.Lock)
+    }
+}
+
+function Get-AssetBytesWithSharedSlot {
+    param(
+        [hashtable]$Shared,
+        [ref]$Session,
+        [string]$Url,
+        [string]$Referrer = ''
+    )
+
+    [void]$Shared.AssetSemaphore.Wait()
+    try {
+        $assetSocket = Get-AssetSessionSocket -Session $Session.Value
+        if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+            if ($Session.Value) {
+                Close-AssetDownloadSession -Session $Session.Value
+            }
+            $Session.Value = New-AssetDownloadSession
+        }
+
+        return (Get-AssetBytesWithBrowser -Session $Session.Value -Url $Url -Referrer $Referrer)
+    }
+    finally {
+        [void]$Shared.AssetSemaphore.Release()
+    }
+}
+
+function Clear-MhtmlWithSharedManifest {
+    param(
+        [hashtable]$Shared,
+        [string]$Text,
+        [string]$Boundary,
+        [string]$SnapshotLocation,
+        [object[]]$AdditionalParts
+    )
+
+    [System.Threading.Monitor]::Enter($Shared.Lock)
+    try {
+        return (Clear-MhtmlExternalPartBodies -Text $Text -Boundary $Boundary -SnapshotLocation $SnapshotLocation -UrlRows $Shared.UrlToRow -AdditionalParts $AdditionalParts)
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($Shared.Lock)
+    }
+}
+
+function Process-MhtmlFile {
+    param(
+        [System.IO.FileInfo]$File,
+        [string]$InputBasePath,
+        [hashtable]$Shared,
+        [switch]$OverwriteExistingOutput
+    )
+
+    $outputMhtmlPath = Get-OutputMhtmlPath -File $File -InputBasePath $InputBasePath -OutputRoot $Shared.StrippedMhtmlRoot
+    if (-not $OverwriteExistingOutput -and (Test-Path -LiteralPath $outputMhtmlPath)) {
+        Add-SharedStat -Shared $Shared -Name 'SkippedExistingMhtml'
+        return
+    }
+
+    Add-SharedStat -Shared $Shared -Name 'Files'
+    Write-Host "Parsing $($File.FullName)"
+
+    $assetSession = $null
+    try {
+        $text = [System.IO.File]::ReadAllText($File.FullName, $Latin1)
+        $rootHeaders = Read-MimeHeaders -HeaderText (Get-InitialHeaderText -Text $text)
+        $snapshotLocation = Get-UnfoldedHeaderValue -Headers $rootHeaders -Name 'Snapshot-Content-Location' -Url
+        $contentType = Get-UnfoldedHeaderValue -Headers $rootHeaders -Name 'Content-Type'
+        $boundary = Get-MimeBoundary -ContentType $contentType
+
+        if (-not $boundary) {
+            Write-Warning "Boundary tidak ditemukan: $($File.FullName)"
+            return
+        }
+
+        $parts = @(Get-MhtmlParts -Text $text -Boundary $boundary)
+        $filePartLocations = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
+        foreach ($part in $parts) {
+            $location = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Location' -Url
+            if ($location -and -not $filePartLocations.ContainsKey($location)) {
+                $filePartLocations[$location] = $true
+            }
+
+            if (-not $location -or $location -notmatch '^https://') {
+                Add-SharedStat -Shared $Shared -Name 'SkippedNonHttpsParts'
+                continue
+            }
+
+            if ($snapshotLocation -and $location -eq $snapshotLocation) {
+                Add-SharedStat -Shared $Shared -Name 'SkippedSnapshotParts'
+                continue
+            }
+
+            $existingRow = Get-ExistingManifestRowFromShared -Shared $Shared -Link $location -MarkSeen
+            if ($existingRow) {
+                Add-SharedStat -Shared $Shared -Name 'SkippedExistingUrls'
+                continue
+            }
+
+            $transferEncoding = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Transfer-Encoding'
+            if (-not $transferEncoding) {
+                $transferEncoding = '7bit'
+            }
+            $partContentType = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Type'
+            if ($partContentType) {
+                $partContentType = (($partContentType -split ';', 2)[0]).Trim()
+            }
+            if (-not $partContentType) {
+                $partContentType = 'application/octet-stream'
+            }
+            $storedEncoding = Normalize-StoredEncoding -Encoding $transferEncoding
+            if (-not $storedEncoding) {
+                $storedEncoding = $transferEncoding
+            }
+
+            if ([string]::IsNullOrEmpty($part.Body)) {
+                Write-Warning "Body kosong dan URL belum ada di manifest, skip: $location"
+                continue
+            }
+
+            try {
+                $bytes = Decode-MimeBody -Body $part.Body -Encoding $transferEncoding
+            }
+            catch {
+                Write-Warning "Gagal decode $location ($transferEncoding) di $($File.Name): $($_.Exception.Message)"
+                continue
+            }
+
+            if ($partContentType -match '(?i)^image/') {
+                $validationError = Test-ImageBytesComplete -Bytes $bytes -ContentType $partContentType -Url $location
+                if (-not [string]::IsNullOrWhiteSpace($validationError)) {
+                    Add-SharedStat -Shared $Shared -Name 'InvalidLocalImageParts'
+                    Write-Warning "Gambar multipart corrupt setelah decode, download ulang: $location - $validationError"
+                    try {
+                        $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session ([ref]$assetSession) -Url $location -Referrer $snapshotLocation
+                        $bytes = [byte[]]$download.Bytes
+                        $partContentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $location -ResponseContentType ([string]$download.ContentType)
+                        $storedEncoding = Get-PreferredManifestEncoding -ContentType $partContentType
+                        Add-SharedStat -Shared $Shared -Name 'DownloadedImgUrls'
+                    }
+                    catch {
+                        Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
+                        Write-Warning "Gagal download ulang gambar multipart corrupt: $location - $($_.Exception.Message)"
+                        continue
+                    }
+                }
+            }
+
+            [void](Register-AssetBytesInShared -Shared $Shared -Link $location -Bytes $bytes -ContentType $partContentType -Encoding $storedEncoding)
+            Add-SharedStat -Shared $Shared -Name 'ExtractedParts'
+        }
+
+        $missingImgParts = New-Object System.Collections.Generic.List[object]
+        foreach ($assetRef in Get-MissingAssetRefsFromMhtml -Parts $parts -SnapshotLocation $snapshotLocation -PartLocations $filePartLocations) {
+            $assetLink = [string]$assetRef.link
+            if (-not $assetLink -or $filePartLocations.ContainsKey($assetLink)) {
+                continue
+            }
+
+            Add-SharedStat -Shared $Shared -Name 'MissingImgUrls'
+            $imgRow = $null
+            $contentType = ''
+
+            if ([string]$assetRef.fetch_mode -eq 'local-video') {
+                $localVideoPath = Resolve-LocalVideoFilePath -Link $assetLink -VideoRoot $VideoMp4Root
+                if (-not $localVideoPath) {
+                    continue
+                }
+
+                try {
+                    $targetName = [System.IO.Path]::GetFileName($localVideoPath)
+                    $targetPath = Join-Path $AssetsVideoRoot $targetName
+                    $shouldCopy = $true
+
+                    if (Test-Path -LiteralPath $targetPath) {
+                        $sourceInfo = Get-Item -LiteralPath $localVideoPath
+                        $targetInfo = Get-Item -LiteralPath $targetPath
+                        if ($sourceInfo.Length -eq $targetInfo.Length) {
+                            $shouldCopy = $false
+                        }
+                    }
+
+                    if ($shouldCopy) {
+                        Copy-Item -LiteralPath $localVideoPath -Destination $targetPath -Force
+                    }
+
+                    Add-SharedStat -Shared $Shared -Name 'LinkedLocalVideoUrls'
+                }
+                catch {
+                    Write-Warning "Gagal proses video lokal: $assetLink - $($_.Exception.Message)"
+                    continue
+                }
+            }
+            else {
+                $imgRow = Get-ExistingManifestRowFromShared -Shared $Shared -Link $assetLink -MarkSeen
+                if ($imgRow) {
+                    $contentType = Get-ContentTypeForManifestRow -Row $imgRow
+                    Add-SharedStat -Shared $Shared -Name 'SkippedExistingUrls'
+                }
+                else {
+                    try {
+                        $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session ([ref]$assetSession) -Url $assetLink -Referrer $snapshotLocation
+                        $bytes = [byte[]]$download.Bytes
+                        $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $assetLink -ResponseContentType ([string]$download.ContentType)
+                        $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
+                        $imgRow = Register-AssetBytesInShared -Shared $Shared -Link $assetLink -Bytes $bytes -ContentType $contentType -Encoding $manifestEncoding
+                        Add-SharedStat -Shared $Shared -Name 'DownloadedImgUrls'
+                    }
+                    catch {
+                        Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
+                        Write-Warning "Gagal download asset tanpa multipart: $assetLink - $($_.Exception.Message)"
+                        continue
+                    }
+                }
+            }
+
+            if ($imgRow) {
+                $missingImgParts.Add([pscustomobject]@{
+                    link = $assetLink
+                    content_type = $contentType
+                    encoding = if ($imgRow -and $imgRow.encoding) { Normalize-StoredEncoding -Encoding ([string]$imgRow.encoding) } else { Get-PreferredManifestEncoding -ContentType $contentType }
+                }) | Out-Null
+                $filePartLocations[$assetLink] = $true
+            }
+        }
+
+        $clearedResult = Clear-MhtmlWithSharedManifest -Shared $Shared -Text $text -Boundary $boundary -SnapshotLocation $snapshotLocation -AdditionalParts ([object[]]$missingImgParts.ToArray())
+        if ($clearedResult.Cleared -gt 0 -or $clearedResult.Added -gt 0) {
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outputMhtmlPath) | Out-Null
+            [System.IO.File]::WriteAllText($outputMhtmlPath, $clearedResult.Text, $Latin1)
+            Add-SharedStat -Shared $Shared -Name 'ClearedPartBodies' -Amount ([Int64]$clearedResult.Cleared)
+            Add-SharedStat -Shared $Shared -Name 'AddedMissingImgParts' -Amount ([Int64]$clearedResult.Added)
+            Add-SharedStat -Shared $Shared -Name 'StrippedMhtmlFiles'
+        }
+
+        Save-ManifestCacheFromShared -Shared $Shared
+    }
+    finally {
+        Close-AssetDownloadSession -Session $assetSession
+    }
+}
+
+function Get-ScriptFunctionDefinitions {
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors -and $parseErrors.Count -gt 0) {
+        throw "Gagal parse script untuk worker parallel: $($parseErrors[0].Message)"
+    }
+
+    $functions = $ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $true)
+
+    return (($functions | ForEach-Object { $_.Extent.Text }) -join "`r`n")
+}
+
+function Invoke-MhtmlFilesParallel {
+    param(
+        [System.IO.FileInfo[]]$Files,
+        [string]$InputBasePath,
+        [hashtable]$Shared,
+        [int]$ThrottleLimit,
+        [string]$FunctionDefinitions,
+        [hashtable]$Context,
+        [switch]$OverwriteExistingOutput
+    )
+
+    $pool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit)
+    $pool.ApartmentState = 'MTA'
+    $pool.Open()
+    $tasks = New-Object System.Collections.Generic.List[object]
+
+    $workerScript = {
+        param(
+            [string]$Definitions,
+            [string]$FilePath,
+            [string]$WorkerInputBasePath,
+            [hashtable]$WorkerShared,
+            [hashtable]$WorkerContext,
+            [bool]$WorkerOverwriteExistingOutput
+        )
+
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-Expression $Definitions
+
+        $script:BrowserPort = if ($WorkerContext.BrowserPort) { [int]$WorkerContext.BrowserPort } else { $null }
+        $script:BrowserProcessId = $null
+        $script:CdpCommandId = 0
+        $script:BrowserProfileDir = [string]$WorkerContext.BrowserProfileDir
+        $script:BrowserReadyTimeoutSeconds = [int]$WorkerContext.BrowserReadyTimeoutSeconds
+
+        $Latin1 = [System.Text.Encoding]::GetEncoding(28591)
+        $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $ImageDownloadAttempts = [int]$WorkerContext.ImageDownloadAttempts
+        $BrowserReadyTimeoutSeconds = [int]$WorkerContext.BrowserReadyTimeoutSeconds
+        $AssetsRoot = [string]$WorkerContext.AssetsRoot
+        $BinRoot = [string]$WorkerContext.BinRoot
+        $AssetsVideoRoot = [string]$WorkerContext.AssetsVideoRoot
+        $VideoMp4Root = [string]$WorkerContext.VideoMp4Root
+        $ScriptRootFull = [string]$WorkerContext.ScriptRootFull
+
+        $file = Get-Item -LiteralPath $FilePath
+        Process-MhtmlFile -File $file -InputBasePath $WorkerInputBasePath -Shared $WorkerShared -OverwriteExistingOutput:([bool]$WorkerOverwriteExistingOutput)
+        return $FilePath
+    }
+
+    try {
+        foreach ($file in $Files) {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($workerScript)
+            [void]$ps.AddArgument($FunctionDefinitions)
+            [void]$ps.AddArgument($file.FullName)
+            [void]$ps.AddArgument($InputBasePath)
+            [void]$ps.AddArgument($Shared)
+            [void]$ps.AddArgument($Context)
+            [void]$ps.AddArgument([bool]$OverwriteExistingOutput)
+            $tasks.Add([pscustomobject]@{
+                PowerShell = $ps
+                Handle = $ps.BeginInvoke()
+                File = $file.FullName
+            }) | Out-Null
+        }
+
+        $errors = New-Object System.Collections.Generic.List[string]
+        foreach ($task in $tasks) {
+            try {
+                [void]$task.PowerShell.EndInvoke($task.Handle)
+            }
+            catch {
+                $errors.Add("$($task.File): $($_.Exception.Message)") | Out-Null
+            }
+        }
+
+        if ($errors.Count -gt 0) {
+            throw "Parallel worker gagal:`n$($errors -join "`n")"
+        }
+    }
+    finally {
+        foreach ($task in $tasks) {
+            if ($task.PowerShell) {
+                $task.PowerShell.Dispose()
+            }
+        }
+
+        $pool.Close()
+        $pool.Dispose()
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $BinRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $AssetsVideoRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $StrippedMhtmlRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TsvPath) | Out-Null
 
-$files = Get-InputMhtmlFiles -Path $InputPath
+$allFiles = @(Get-InputMhtmlFiles -Path $InputPath)
 $inputItem = Get-Item -LiteralPath $InputPath
 if ($inputItem.PSIsContainer) {
     $inputBasePath = $inputItem.FullName
@@ -1702,17 +2185,21 @@ if ($inputItem.PSIsContainer) {
 else {
     $inputBasePath = $inputItem.DirectoryName
 }
+
 $hashToPath = Import-ExistingHashMap -ManifestPath $TsvPath
 $urlToRow = Import-ExistingUrlMap -ManifestPath $TsvPath
 $rows = New-Object System.Collections.Generic.List[object]
 $seenRows = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
 $stats = [ordered]@{
+    InputMhtmlFiles = $allFiles.Count
+    QueuedMhtmlFiles = 0
     Files = 0
     ExtractedParts = 0
     WrittenFiles = 0
     ReusedFiles = 0
     ClearedPartBodies = 0
     StrippedMhtmlFiles = 0
+    SkippedExistingMhtml = 0
     MissingImgUrls = 0
     DownloadedImgUrls = 0
     FailedImgUrls = 0
@@ -1724,273 +2211,79 @@ $stats = [ordered]@{
     SkippedNonHttpsParts = 0
 }
 
-$assetSession = $null
-
-try {
-if (-not (Test-Path -LiteralPath $TsvPath)) {
-    Save-ManifestCache -UrlRows $urlToRow -ManifestPath $TsvPath
-}
-
-foreach ($file in $files) {
-    $stats.Files++
-    Write-Host "Parsing $($file.FullName)"
-
-    $text = [System.IO.File]::ReadAllText($file.FullName, $Latin1)
-    $rootHeaders = Read-MimeHeaders -HeaderText (Get-InitialHeaderText -Text $text)
-    $snapshotLocation = Get-UnfoldedHeaderValue -Headers $rootHeaders -Name 'Snapshot-Content-Location' -Url
-    $contentType = Get-UnfoldedHeaderValue -Headers $rootHeaders -Name 'Content-Type'
-    $boundary = Get-MimeBoundary -ContentType $contentType
-
-    if (-not $boundary) {
-        Write-Warning "Boundary tidak ditemukan: $($file.FullName)"
+$files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+foreach ($file in $allFiles) {
+    $outputMhtmlPath = Get-OutputMhtmlPath -File $file -InputBasePath $inputBasePath -OutputRoot $StrippedMhtmlRoot
+    if (-not $OverwriteExistingOutput -and (Test-Path -LiteralPath $outputMhtmlPath)) {
+        $stats.SkippedExistingMhtml++
         continue
     }
 
-    $parts = @(Get-MhtmlParts -Text $text -Boundary $boundary)
-    $filePartLocations = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
-    foreach ($part in $parts) {
-        $location = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Location' -Url
-        if ($location -and -not $filePartLocations.ContainsKey($location)) {
-            $filePartLocations[$location] = $true
-        }
-
-        if (-not $location -or $location -notmatch '^https://') {
-            $stats.SkippedNonHttpsParts++
-            continue
-        }
-
-        if ($snapshotLocation -and $location -eq $snapshotLocation) {
-            $stats.SkippedSnapshotParts++
-            continue
-        }
-
-        if ($urlToRow.ContainsKey($location)) {
-            Add-ManifestRow -Row $urlToRow[$location] -UrlRows $urlToRow -SeenRows $seenRows -Rows $rows -ManifestPath $TsvPath
-            $stats.SkippedExistingUrls++
-            continue
-        }
-
-        $transferEncoding = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Transfer-Encoding'
-        if (-not $transferEncoding) {
-            $transferEncoding = '7bit'
-        }
-        $partContentType = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Type'
-        if ($partContentType) {
-            $partContentType = (($partContentType -split ';', 2)[0]).Trim()
-        }
-        if (-not $partContentType) {
-            $partContentType = 'application/octet-stream'
-        }
-        $storedEncoding = Normalize-StoredEncoding -Encoding $transferEncoding
-        if (-not $storedEncoding) {
-            $storedEncoding = $transferEncoding
-        }
-
-        if ([string]::IsNullOrEmpty($part.Body)) {
-            Write-Warning "Body kosong dan URL belum ada di manifest, skip: $location"
-            continue
-        }
-
-        try {
-            $bytes = Decode-MimeBody -Body $part.Body -Encoding $transferEncoding
-        }
-        catch {
-            Write-Warning "Gagal decode $location ($transferEncoding) di $($file.Name): $($_.Exception.Message)"
-            continue
-        }
-
-        if ($partContentType -match '(?i)^image/') {
-            $validationError = Test-ImageBytesComplete -Bytes $bytes -ContentType $partContentType -Url $location
-            if (-not [string]::IsNullOrWhiteSpace($validationError)) {
-                $stats.InvalidLocalImageParts++
-                Write-Warning "Gambar multipart corrupt setelah decode, download ulang: $location - $validationError"
-                try {
-                    $assetSocket = Get-AssetSessionSocket -Session $assetSession
-                    if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
-                        if ($assetSession) {
-                            Close-AssetDownloadSession -Session $assetSession
-                        }
-                        $assetSession = New-AssetDownloadSession
-                    }
-
-                    $download = Get-AssetBytesWithBrowser -Session $assetSession -Url $location -Referrer $snapshotLocation
-                    $bytes = [byte[]]$download.Bytes
-                    $partContentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $location -ResponseContentType ([string]$download.ContentType)
-                    $storedEncoding = Get-PreferredManifestEncoding -ContentType $partContentType
-                    $stats.DownloadedImgUrls++
-                }
-                catch {
-                    $stats.FailedImgUrls++
-                    Write-Warning "Gagal download ulang gambar multipart corrupt: $location - $($_.Exception.Message)"
-                    continue
-                }
-            }
-        }
-
-        $sha256 = Get-Sha256Hex -Bytes $bytes
-        $size = [Int64]$bytes.LongLength
-        $contentKey = "$sha256`t$size"
-
-        if ($hashToPath.ContainsKey($contentKey)) {
-            $relativePath = $hashToPath[$contentKey]
-            $stats.ReusedFiles++
-        }
-        else {
-            do {
-                $uuid = New-UuidV7
-                $relativePath = Get-RelativeAssetPath -Uuid $uuid
-                $fullPath = ConvertTo-FullPath -RelativePath $relativePath
-            } while (Test-Path -LiteralPath $fullPath)
-
-            [System.IO.File]::WriteAllBytes($fullPath, $bytes)
-            $hashToPath[$contentKey] = $relativePath
-            $stats.WrittenFiles++
-        }
-
-        $stats.ExtractedParts++
-        $newRow = [pscustomobject]@{
-            link = $location
-            path = $relativePath
-            type = $partContentType
-            encoding = $storedEncoding
-            sha256 = $sha256
-            size_bytes = $size
-        }
-        Add-ManifestRow -Row $newRow -UrlRows $urlToRow -SeenRows $seenRows -Rows $rows -ManifestPath $TsvPath -SaveNow
-    }
-
-    $missingImgParts = New-Object System.Collections.Generic.List[object]
-    foreach ($assetRef in Get-MissingAssetRefsFromMhtml -Parts $parts -SnapshotLocation $snapshotLocation -PartLocations $filePartLocations) {
-        $assetLink = [string]$assetRef.link
-        if (-not $assetLink -or $filePartLocations.ContainsKey($assetLink)) {
-            continue
-        }
-
-        $stats.MissingImgUrls++
-        $imgRow = $null
-        $contentType = ''
-
-        if ([string]$assetRef.fetch_mode -eq 'local-video') {
-            $localVideoPath = Resolve-LocalVideoFilePath -Link $assetLink -VideoRoot $VideoMp4Root
-            if (-not $localVideoPath) {
-                continue
-            }
-
-            try {
-                $targetName = [System.IO.Path]::GetFileName($localVideoPath)
-                $targetPath = Join-Path $AssetsVideoRoot $targetName
-                $shouldCopy = $true
-
-                if (Test-Path -LiteralPath $targetPath) {
-                    $sourceInfo = Get-Item -LiteralPath $localVideoPath
-                    $targetInfo = Get-Item -LiteralPath $targetPath
-                    if ($sourceInfo.Length -eq $targetInfo.Length) {
-                        $shouldCopy = $false
-                    }
-                }
-
-                if ($shouldCopy) {
-                    Copy-Item -LiteralPath $localVideoPath -Destination $targetPath -Force
-                }
-
-                $stats.LinkedLocalVideoUrls++
-            }
-            catch {
-                Write-Warning "Gagal proses video lokal: $assetLink - $($_.Exception.Message)"
-                continue
-            }
-        }
-        elseif ($urlToRow.ContainsKey($assetLink)) {
-            $imgRow = $urlToRow[$assetLink]
-            $contentType = Get-ContentTypeForManifestRow -Row $imgRow
-            Add-ManifestRow -Row $imgRow -UrlRows $urlToRow -SeenRows $seenRows -Rows $rows -ManifestPath $TsvPath
-            $stats.SkippedExistingUrls++
-        }
-        else {
-            try {
-                $assetSocket = Get-AssetSessionSocket -Session $assetSession
-                if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
-                    if ($assetSession) {
-                        Close-AssetDownloadSession -Session $assetSession
-                    }
-                    $assetSession = New-AssetDownloadSession
-                }
-
-                $download = Get-AssetBytesWithBrowser -Session $assetSession -Url $assetLink -Referrer $snapshotLocation
-                $bytes = [byte[]]$download.Bytes
-                $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $assetLink -ResponseContentType ([string]$download.ContentType)
-                $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
-                $sha256 = Get-Sha256Hex -Bytes $bytes
-                $size = [Int64]$bytes.LongLength
-                $contentKey = "$sha256`t$size"
-
-                if ($hashToPath.ContainsKey($contentKey)) {
-                    $relativePath = $hashToPath[$contentKey]
-                    $stats.ReusedFiles++
-                }
-                else {
-                    do {
-                        $uuid = New-UuidV7
-                        $relativePath = Get-RelativeAssetPath -Uuid $uuid
-                        $fullPath = ConvertTo-FullPath -RelativePath $relativePath
-                    } while (Test-Path -LiteralPath $fullPath)
-
-                    [System.IO.File]::WriteAllBytes($fullPath, $bytes)
-                    $hashToPath[$contentKey] = $relativePath
-                    $stats.WrittenFiles++
-                }
-
-                $imgRow = [pscustomobject]@{
-                    link = $assetLink
-                    path = $relativePath
-                    type = $contentType
-                    encoding = $manifestEncoding
-                    sha256 = $sha256
-                    size_bytes = $size
-                }
-                Add-ManifestRow -Row $imgRow -UrlRows $urlToRow -SeenRows $seenRows -Rows $rows -ManifestPath $TsvPath -SaveNow
-                $stats.DownloadedImgUrls++
-            }
-            catch {
-                $stats.FailedImgUrls++
-                Write-Warning "Gagal download asset tanpa multipart: $assetLink - $($_.Exception.Message)"
-                continue
-            }
-        }
-
-        if ($imgRow) {
-            $missingImgParts.Add([pscustomobject]@{
-                link = $assetLink
-                content_type = $contentType
-                encoding = if ($imgRow -and $imgRow.encoding) { Normalize-StoredEncoding -Encoding ([string]$imgRow.encoding) } else { Get-PreferredManifestEncoding -ContentType $contentType }
-            }) | Out-Null
-            $filePartLocations[$assetLink] = $true
-        }
-    }
-
-    $clearedResult = Clear-MhtmlExternalPartBodies -Text $text -Boundary $boundary -SnapshotLocation $snapshotLocation -UrlRows $urlToRow -AdditionalParts ([object[]]$missingImgParts.ToArray())
-    if ($clearedResult.Cleared -gt 0 -or $clearedResult.Added -gt 0) {
-        $relativeMhtmlPath = Get-RelativePathFromBase -BasePath $inputBasePath -FullPath $file.FullName
-        $outputMhtmlPath = Join-Path $StrippedMhtmlRoot $relativeMhtmlPath
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outputMhtmlPath) | Out-Null
-        [System.IO.File]::WriteAllText($outputMhtmlPath, $clearedResult.Text, $Latin1)
-        $stats.ClearedPartBodies += $clearedResult.Cleared
-        $stats.AddedMissingImgParts += $clearedResult.Added
-        $stats.StrippedMhtmlFiles++
-    }
-
-    Save-ManifestCache -UrlRows $urlToRow -ManifestPath $TsvPath
+    $files.Add($file) | Out-Null
 }
+$stats.QueuedMhtmlFiles = $files.Count
 
+$shared = [hashtable]::Synchronized(@{
+    Lock = [object]::new()
+    AssetSemaphore = [System.Threading.SemaphoreSlim]::new($AssetParallelism, $AssetParallelism)
+    Stats = $stats
+    HashToPath = $hashToPath
+    UrlToRow = $urlToRow
+    Rows = $rows
+    SeenRows = $seenRows
+    TsvPath = $TsvPath
+    StrippedMhtmlRoot = $StrippedMhtmlRoot
+})
+
+try {
+    if (-not (Test-Path -LiteralPath $TsvPath)) {
+        Save-ManifestCacheFromShared -Shared $shared
+    }
+
+    Write-Host "Input MHTML files    : $($stats.InputMhtmlFiles)"
+    Write-Host "Existing output skip : $($stats.SkippedExistingMhtml)"
+    Write-Host "Queued MHTML files   : $($stats.QueuedMhtmlFiles)"
+    Write-Host "File parallelism     : $FileParallelism"
+    Write-Host "Asset parallelism    : $AssetParallelism"
+
+    if ($files.Count -gt 0) {
+        if ($FileParallelism -le 1) {
+            foreach ($file in $files) {
+                Process-MhtmlFile -File $file -InputBasePath $inputBasePath -Shared $shared -OverwriteExistingOutput:$OverwriteExistingOutput
+            }
+        }
+        else {
+            Ensure-Edge
+            $functionDefinitions = Get-ScriptFunctionDefinitions
+            $context = @{
+                AssetsRoot = $AssetsRoot
+                BinRoot = $BinRoot
+                AssetsVideoRoot = $AssetsVideoRoot
+                VideoMp4Root = $VideoMp4Root
+                ScriptRootFull = $ScriptRootFull
+                BrowserPort = $script:BrowserPort
+                BrowserProfileDir = $script:BrowserProfileDir
+                ImageDownloadAttempts = $ImageDownloadAttempts
+                BrowserReadyTimeoutSeconds = $BrowserReadyTimeoutSeconds
+            }
+
+            Invoke-MhtmlFilesParallel -Files ([System.IO.FileInfo[]]$files.ToArray()) -InputBasePath $inputBasePath -Shared $shared -ThrottleLimit $FileParallelism -FunctionDefinitions $functionDefinitions -Context $context -OverwriteExistingOutput:$OverwriteExistingOutput
+        }
+    }
 }
 finally {
-    Close-AssetDownloadSession -Session $assetSession
     Close-EdgeBrowser
-    Save-ManifestCache -UrlRows $urlToRow -ManifestPath $TsvPath
+    Save-ManifestCacheFromShared -Shared $shared
+    if ($shared.AssetSemaphore) {
+        $shared.AssetSemaphore.Dispose()
+    }
 }
 
 Write-Host ''
 Write-Host "Done."
+Write-Host "Input MHTML files    : $($stats.InputMhtmlFiles)"
+Write-Host "Queued MHTML files   : $($stats.QueuedMhtmlFiles)"
+Write-Host "Skipped output MHTML : $($stats.SkippedExistingMhtml)"
 Write-Host "Files parsed          : $($stats.Files)"
 Write-Host "Parts extracted      : $($stats.ExtractedParts)"
 Write-Host "Files written        : $($stats.WrittenFiles)"
