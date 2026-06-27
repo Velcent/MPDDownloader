@@ -7,7 +7,7 @@ param(
     [int]$ImageDownloadAttempts = 100000,
     [int]$BrowserReadyTimeoutSeconds = 60,
     [int]$FileParallelism = 1,
-    [int]$AssetParallelism = 5,
+    [int]$AssetParallelism = 1,
     [switch]$OverwriteExistingOutput
 )
 
@@ -1562,7 +1562,28 @@ function Get-AssetBytesFromNetworkBody {
         throw "RequestId asset tidak ditemukan: $Url"
     }
 
-    $bodyResponse = Invoke-CdpCommand -Socket $Socket -Method 'Network.getResponseBody' -Params @{ requestId = $State.RequestId }
+    $bodyResponse = $null
+    $bodyError = ''
+    for ($bodyAttempt = 1; $bodyAttempt -le 3; $bodyAttempt++) {
+        try {
+            $bodyResponse = Invoke-CdpCommand -Socket $Socket -Method 'Network.getResponseBody' -Params @{ requestId = $State.RequestId }
+            break
+        }
+        catch {
+            $bodyError = $_.Exception.Message
+            try {
+                [void](Wait-BrowserPageComplete -Socket $Socket -Url $Url)
+            }
+            catch {
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    if (-not $bodyResponse) {
+        throw $bodyError
+    }
+
     $body = [string]$bodyResponse.result.body
     if ([bool]$bodyResponse.result.base64Encoded) {
         $bytes = [Convert]::FromBase64String($body)
@@ -1662,6 +1683,18 @@ function Wait-DownloadedAssetFile {
     throw "Timeout menunggu download temp selesai."
 }
 
+function Test-DownloadTempHasFiles {
+    param([string]$DownloadPath)
+
+    if (-not (Test-Path -LiteralPath $DownloadPath)) {
+        return $false
+    }
+
+    return @(
+        Get-ChildItem -LiteralPath $DownloadPath -File -ErrorAction SilentlyContinue
+    ).Count -gt 0
+}
+
 function Remove-AssetDownloadTempDirectory {
     param(
         [string]$DownloadRoot,
@@ -1723,6 +1756,11 @@ function Get-AssetBytesWithDownloadFallback {
                 return (Get-AssetBytesFromNetworkBody -Socket $socket -Url $Url -NavigateResult $nav -State $networkState)
             }
             catch {
+                $networkBodyError = $_.Exception.Message
+                if (-not (Test-DownloadTempHasFiles -DownloadPath $downloadPath)) {
+                    throw "Asset terbuka inline tapi body CDP gagal dibaca: $networkBodyError"
+                }
+
                 $downloadedAfterRender = Wait-DownloadedAssetFile -DownloadPath $downloadPath
                 if (-not $downloadedAfterRender) {
                     throw
