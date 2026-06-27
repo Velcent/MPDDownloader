@@ -4,10 +4,10 @@ param(
     [string]$AssetsRoot = '',
     [string]$StrippedMhtmlRoot = '',
     [string]$TsvPath = '',
-    [int]$ImageDownloadAttempts = 100000,
+    [int]$ImageDownloadAttempts = 20,
     [int]$BrowserReadyTimeoutSeconds = 60,
-    [int]$FileParallelism = 1,
-    [int]$AssetParallelism = 1,
+    [int]$FileParallelism = 5,
+    [int]$AssetParallelism = 5,
     [switch]$OverwriteExistingOutput
 )
 
@@ -1987,6 +1987,41 @@ function Write-ManifestFile {
     Copy-Item -LiteralPath $ManifestPath -Destination ($ManifestPath + '.bak') -Force
 }
 
+function ConvertTo-ManifestTsvLine {
+    param([object]$Row)
+
+    $rowType = if ((Test-ObjectProperty -Object $Row -Name 'type') -and -not [string]::IsNullOrWhiteSpace([string]$Row.type)) {
+        [string]$Row.type
+    }
+    else {
+        Get-ContentTypeForManifestRow -Row $Row
+    }
+
+    return (@(
+        ConvertTo-TsvValue $Row.link
+        ConvertTo-TsvValue $Row.path
+        ConvertTo-TsvValue $rowType
+        ConvertTo-TsvValue $Row.encoding
+        ConvertTo-TsvValue $Row.sha256
+        ConvertTo-TsvValue ([string]$Row.size_bytes)
+    ) -join "`t")
+}
+
+function Append-ManifestRow {
+    param(
+        [object]$Row,
+        [string]$ManifestPath
+    )
+
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ManifestPath) | Out-Null
+    if (-not (Test-Path -LiteralPath $ManifestPath)) {
+        [System.IO.File]::WriteAllLines($ManifestPath, @("link`tpath`ttype`tencoding`tsha256`tsize_bytes"), $Utf8NoBom)
+    }
+
+    [System.IO.File]::AppendAllText($ManifestPath, (ConvertTo-ManifestTsvLine -Row $Row) + "`r`n", $Utf8NoBom)
+    Copy-Item -LiteralPath $ManifestPath -Destination ($ManifestPath + '.bak') -Force
+}
+
 function Save-ManifestCache {
     param(
         [System.Collections.Generic.Dictionary[string,object]]$UrlRows,
@@ -2016,14 +2051,15 @@ function Add-ManifestRow {
     }
 
     $link = [string]$Row.link
+    $isNewLink = -not $UrlRows.ContainsKey($link)
     $UrlRows[$link] = $Row
     if (-not $SeenRows.ContainsKey($link)) {
         $SeenRows[$link] = $true
         $Rows.Add($Row) | Out-Null
     }
 
-    if ($SaveNow) {
-        Save-ManifestCache -UrlRows $UrlRows -ManifestPath $ManifestPath
+    if ($SaveNow -and $isNewLink) {
+        Append-ManifestRow -Row $Row -ManifestPath $ManifestPath
     }
 }
 
@@ -2440,7 +2476,6 @@ function Process-MhtmlFile {
         if ($fileHasAssetFailure) {
             Add-SharedStat -Shared $Shared -Name 'SkippedMhtmlAssetFailures'
             Write-Warning "Output MHTML tidak ditulis karena ada asset gagal: $($File.FullName)"
-            Save-ManifestCacheFromShared -Shared $Shared
             return
         }
 
@@ -2452,8 +2487,6 @@ function Process-MhtmlFile {
             Add-SharedStat -Shared $Shared -Name 'AddedMissingImgParts' -Amount ([Int64]$clearedResult.Added)
             Add-SharedStat -Shared $Shared -Name 'StrippedMhtmlFiles'
         }
-
-        Save-ManifestCacheFromShared -Shared $Shared
     }
     finally {
         if (-not $AssetSessionRef) {
