@@ -1239,38 +1239,6 @@ function Receive-WebSocketText {
     }
 }
 
-function Receive-WebSocketTextWithTimeout {
-    param(
-        [System.Net.WebSockets.ClientWebSocket]$Socket,
-        [int]$TimeoutMilliseconds = 500
-    )
-
-    $buffer = New-Object byte[] 65536
-    $stream = New-Object System.IO.MemoryStream
-    $cts = [Threading.CancellationTokenSource]::new()
-
-    try {
-        $cts.CancelAfter($TimeoutMilliseconds)
-        do {
-            $segment = [ArraySegment[byte]]::new($buffer)
-            $result = $Socket.ReceiveAsync($segment, $cts.Token).GetAwaiter().GetResult()
-
-            if ($result.Count -gt 0) {
-                $stream.Write($buffer, 0, $result.Count)
-            }
-        } while (-not $result.EndOfMessage)
-
-        return [System.Text.Encoding]::UTF8.GetString($stream.ToArray())
-    }
-    catch [System.OperationCanceledException] {
-        return $null
-    }
-    finally {
-        $cts.Dispose()
-        $stream.Dispose()
-    }
-}
-
 function Invoke-CdpCommand {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
@@ -1469,10 +1437,7 @@ function Invoke-CdpCommandCollectEvents {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        $responseText = Receive-WebSocketTextWithTimeout -Socket $Socket -TimeoutMilliseconds 500
-        if ($null -eq $responseText) {
-            continue
-        }
+        $responseText = Receive-WebSocketText $Socket
         $response = $responseText | ConvertFrom-Json
         $responseId = if (Test-ObjectProperty -Object $response -Name 'id') { $response.id } else { $null }
         if ($null -eq $responseId -and $OnEvent) {
@@ -1504,10 +1469,7 @@ function Wait-NetworkRequestFinished {
             return
         }
 
-        $eventText = Receive-WebSocketTextWithTimeout -Socket $Socket -TimeoutMilliseconds 500
-        if ($null -eq $eventText) {
-            continue
-        }
+        $eventText = Receive-WebSocketText $Socket
         $event = $eventText | ConvertFrom-Json
         Update-NetworkAssetState -Event $event -State $State
     }
@@ -1523,11 +1485,20 @@ function Update-NetworkAssetState {
         return
     }
 
-    if ([string]$Event.method -eq 'Network.responseReceived') {
+    if ([string]$Event.method -eq 'Network.requestWillBeSent') {
+        $params = $Event.params
+        $request = $params.request
+        $requestUrl = if ($request -and (Test-ObjectProperty -Object $request -Name 'url')) { [string]$request.url } else { '' }
+        if ($requestUrl -eq $State.Url -or (-not $State.RequestId -and (Test-ObjectProperty -Object $params -Name 'type') -and $params.type -eq 'Document')) {
+            $State.RequestId = [string]$params.requestId
+            $State.ResponseUrl = $requestUrl
+        }
+    }
+    elseif ([string]$Event.method -eq 'Network.responseReceived') {
         $params = $Event.params
         $response = $params.response
         $responseUrl = if ($response -and (Test-ObjectProperty -Object $response -Name 'url')) { [string]$response.url } else { '' }
-        if ($responseUrl -eq $State.Url -or (-not $State.RequestId -and $params.type -eq 'Document')) {
+        if ($responseUrl -eq $State.Url -or (-not $State.RequestId -and (Test-ObjectProperty -Object $params -Name 'type') -and $params.type -eq 'Document')) {
             $State.RequestId = [string]$params.requestId
             $State.ResponseUrl = $responseUrl
             $State.ContentType = if ($response -and (Test-ObjectProperty -Object $response -Name 'mimeType')) { [string]$response.mimeType } else { '' }
@@ -1578,13 +1549,13 @@ function Get-AssetBytesFromNetworkBody {
         })
     }
 
-    if ([string]::IsNullOrWhiteSpace($State.RequestId) -and $NavigateResult -and (Test-ObjectProperty -Object $NavigateResult -Name 'result') -and (Test-ObjectProperty -Object $NavigateResult.result -Name 'loaderId')) {
-        $State.RequestId = [string]$NavigateResult.result.loaderId
-    }
-
     Wait-NetworkRequestFinished -Socket $Socket -State $State -TimeoutSeconds $BrowserReadyTimeoutSeconds
     if ($State.Failed) {
         throw $State.ErrorText
+    }
+
+    if ([string]::IsNullOrWhiteSpace($State.RequestId) -and $NavigateResult -and (Test-ObjectProperty -Object $NavigateResult -Name 'result') -and (Test-ObjectProperty -Object $NavigateResult.result -Name 'loaderId')) {
+        $State.RequestId = [string]$NavigateResult.result.loaderId
     }
 
     if ([string]::IsNullOrWhiteSpace($State.RequestId)) {
@@ -1770,14 +1741,22 @@ function Get-AssetBytesWithBrowser {
     $lastError = ''
     for ($attempt = 1; $attempt -le $ImageDownloadAttempts; $attempt++) {
         try {
+            if ($socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                throw "Socket Edge tidak aktif: $($socket.State)"
+            }
+
             if ($attempt -gt 1) {
-                Write-Warning "Reload ulang img gagal: $Url"
+                Write-Warning "Attempt asset sebelumnya gagal, coba ulang: $Url - $lastError"
             }
 
             return (Get-AssetBytesWithDownloadFallback -Session $Session -Url $Url -Referrer $Referrer)
         }
         catch {
             $lastError = $_.Exception.Message
+            if ($socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                break
+            }
+
             if ($attempt -ge $ImageDownloadAttempts) {
                 break
             }
