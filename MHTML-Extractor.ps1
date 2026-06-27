@@ -2132,7 +2132,8 @@ function Process-MhtmlFile {
         [System.IO.FileInfo]$File,
         [string]$InputBasePath,
         [hashtable]$Shared,
-        [switch]$OverwriteExistingOutput
+        [switch]$OverwriteExistingOutput,
+        $AssetSessionRef = $null
     )
 
     $outputMhtmlPath = Get-OutputMhtmlPath -File $File -InputBasePath $InputBasePath -OutputRoot $Shared.StrippedMhtmlRoot
@@ -2216,7 +2217,8 @@ function Process-MhtmlFile {
                     Add-SharedStat -Shared $Shared -Name 'InvalidLocalImageParts'
                     Write-Warning "Gambar multipart corrupt setelah decode, download ulang: $location - $validationError"
                     try {
-                        $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session ([ref]$assetSession) -Url $location -Referrer $snapshotLocation
+                        $sessionRef = if ($AssetSessionRef) { $AssetSessionRef } else { [ref]$assetSession }
+                        $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session $sessionRef -Url $location -Referrer $snapshotLocation
                         $bytes = [byte[]]$download.Bytes
                         $partContentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $location -ResponseContentType ([string]$download.ContentType)
                         $storedEncoding = Get-PreferredManifestEncoding -ContentType $partContentType
@@ -2283,7 +2285,8 @@ function Process-MhtmlFile {
                 }
                 else {
                     try {
-                        $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session ([ref]$assetSession) -Url $assetLink -Referrer $snapshotLocation
+                        $sessionRef = if ($AssetSessionRef) { $AssetSessionRef } else { [ref]$assetSession }
+                        $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session $sessionRef -Url $assetLink -Referrer $snapshotLocation
                         $bytes = [byte[]]$download.Bytes
                         $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $assetLink -ResponseContentType ([string]$download.ContentType)
                         $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
@@ -2320,7 +2323,9 @@ function Process-MhtmlFile {
         Save-ManifestCacheFromShared -Shared $Shared
     }
     finally {
-        Close-AssetDownloadSession -Session $assetSession
+        if (-not $AssetSessionRef) {
+            Close-AssetDownloadSession -Session $assetSession
+        }
     }
 }
 
@@ -2359,7 +2364,7 @@ function Invoke-MhtmlFilesParallel {
     $workerScript = {
         param(
             [string]$Definitions,
-            [string]$FilePath,
+            [string[]]$FilePaths,
             [string]$WorkerInputBasePath,
             [hashtable]$WorkerShared,
             [hashtable]$WorkerContext,
@@ -2387,18 +2392,41 @@ function Invoke-MhtmlFilesParallel {
         $VideoMp4Root = [string]$WorkerContext.VideoMp4Root
         $ScriptRootFull = [string]$WorkerContext.ScriptRootFull
 
-        $file = Get-Item -LiteralPath $FilePath
-        Process-MhtmlFile -File $file -InputBasePath $WorkerInputBasePath -Shared $WorkerShared -OverwriteExistingOutput:([bool]$WorkerOverwriteExistingOutput)
-        return $FilePath
+        $workerAssetSession = $null
+        try {
+            foreach ($filePath in $FilePaths) {
+                $file = Get-Item -LiteralPath $filePath
+                Process-MhtmlFile -File $file -InputBasePath $WorkerInputBasePath -Shared $WorkerShared -OverwriteExistingOutput:([bool]$WorkerOverwriteExistingOutput) -AssetSessionRef ([ref]$workerAssetSession)
+            }
+        }
+        finally {
+            Close-AssetDownloadSession -Session $workerAssetSession
+        }
+
+        return ($FilePaths -join "`n")
     }
 
     try {
-        foreach ($file in $Files) {
+        $workerCount = [Math]::Min($ThrottleLimit, $Files.Count)
+        $chunks = New-Object System.Collections.Generic.List[object]
+        for ($i = 0; $i -lt $workerCount; $i++) {
+            $chunks.Add((New-Object 'System.Collections.Generic.List[string]')) | Out-Null
+        }
+
+        for ($i = 0; $i -lt $Files.Count; $i++) {
+            $chunks[$i % $workerCount].Add($Files[$i].FullName) | Out-Null
+        }
+
+        foreach ($chunk in $chunks) {
+            if ($chunk.Count -eq 0) {
+                continue
+            }
+
             $ps = [powershell]::Create()
             $ps.RunspacePool = $pool
             [void]$ps.AddScript($workerScript)
             [void]$ps.AddArgument($FunctionDefinitions)
-            [void]$ps.AddArgument($file.FullName)
+            [void]$ps.AddArgument([string[]]$chunk.ToArray())
             [void]$ps.AddArgument($InputBasePath)
             [void]$ps.AddArgument($Shared)
             [void]$ps.AddArgument($Context)
@@ -2406,7 +2434,7 @@ function Invoke-MhtmlFilesParallel {
             $tasks.Add([pscustomobject]@{
                 PowerShell = $ps
                 Handle = $ps.BeginInvoke()
-                File = $file.FullName
+                File = "$($chunk.Count) file(s)"
             }) | Out-Null
         }
 
@@ -2520,8 +2548,14 @@ try {
 
     if ($files.Count -gt 0) {
         if ($FileParallelism -le 1) {
-            foreach ($file in $files) {
-                Process-MhtmlFile -File $file -InputBasePath $inputBasePath -Shared $shared -OverwriteExistingOutput:$OverwriteExistingOutput
+            $singleAssetSession = $null
+            try {
+                foreach ($file in $files) {
+                    Process-MhtmlFile -File $file -InputBasePath $inputBasePath -Shared $shared -OverwriteExistingOutput:$OverwriteExistingOutput -AssetSessionRef ([ref]$singleAssetSession)
+                }
+            }
+            finally {
+                Close-AssetDownloadSession -Session $singleAssetSession
             }
         }
         else {
