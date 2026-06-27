@@ -7,7 +7,7 @@ param(
     [int]$ImageDownloadAttempts = 100000,
     [int]$BrowserReadyTimeoutSeconds = 60,
     [int]$FileParallelism = 1,
-    [int]$AssetParallelism = 1,
+    [int]$AssetParallelism = 5,
     [switch]$OverwriteExistingOutput
 )
 
@@ -2169,6 +2169,7 @@ function Process-MhtmlFile {
     Write-Host "Parsing $($File.FullName)"
 
     $assetSession = $null
+    $fileHasAssetFailure = $false
     try {
         $text = [System.IO.File]::ReadAllText($File.FullName, $Latin1)
         $rootHeaders = Read-MimeHeaders -HeaderText (Get-InitialHeaderText -Text $text)
@@ -2223,16 +2224,18 @@ function Process-MhtmlFile {
 
             if ([string]::IsNullOrEmpty($part.Body)) {
                 Write-Warning "Body kosong dan URL belum ada di manifest, skip: $location"
+                $fileHasAssetFailure = $true
                 continue
             }
 
             try {
                 $bytes = Decode-MimeBody -Body $part.Body -Encoding $transferEncoding
             }
-            catch {
-                Write-Warning "Gagal decode $location ($transferEncoding) di $($File.Name): $($_.Exception.Message)"
-                continue
-            }
+                catch {
+                    Write-Warning "Gagal decode $location ($transferEncoding) di $($File.Name): $($_.Exception.Message)"
+                    $fileHasAssetFailure = $true
+                    continue
+                }
 
             if ($partContentType -match '(?i)^image/') {
                 $validationError = Test-ImageBytesComplete -Bytes $bytes -ContentType $partContentType -Url $location
@@ -2250,6 +2253,7 @@ function Process-MhtmlFile {
                     catch {
                         Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
                         Write-Warning "Gagal download ulang gambar multipart corrupt: $location - $($_.Exception.Message)"
+                        $fileHasAssetFailure = $true
                         continue
                     }
                 }
@@ -2273,6 +2277,7 @@ function Process-MhtmlFile {
             if ([string]$assetRef.fetch_mode -eq 'local-video') {
                 $localVideoPath = Resolve-LocalVideoFilePath -Link $assetLink -VideoRoot $VideoMp4Root
                 if (-not $localVideoPath) {
+                    $fileHasAssetFailure = $true
                     continue
                 }
 
@@ -2297,6 +2302,7 @@ function Process-MhtmlFile {
                 }
                 catch {
                     Write-Warning "Gagal proses video lokal: $assetLink - $($_.Exception.Message)"
+                    $fileHasAssetFailure = $true
                     continue
                 }
             }
@@ -2319,6 +2325,7 @@ function Process-MhtmlFile {
                     catch {
                         Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
                         Write-Warning "Gagal download asset tanpa multipart: $assetLink - $($_.Exception.Message)"
+                        $fileHasAssetFailure = $true
                         continue
                     }
                 }
@@ -2332,6 +2339,13 @@ function Process-MhtmlFile {
                 }) | Out-Null
                 $filePartLocations[$assetLink] = $true
             }
+        }
+
+        if ($fileHasAssetFailure) {
+            Add-SharedStat -Shared $Shared -Name 'SkippedMhtmlAssetFailures'
+            Write-Warning "Output MHTML tidak ditulis karena ada asset gagal: $($File.FullName)"
+            Save-ManifestCacheFromShared -Shared $Shared
+            return
         }
 
         $clearedResult = Clear-MhtmlWithSharedManifest -Shared $Shared -Text $text -Boundary $boundary -SnapshotLocation $snapshotLocation -AdditionalParts ([object[]]$missingImgParts.ToArray())
@@ -2522,6 +2536,7 @@ $stats = [ordered]@{
     ClearedPartBodies = 0
     StrippedMhtmlFiles = 0
     SkippedExistingMhtml = 0
+    SkippedMhtmlAssetFailures = 0
     MissingImgUrls = 0
     DownloadedImgUrls = 0
     FailedImgUrls = 0
@@ -2621,6 +2636,7 @@ Write-Host "Files written        : $($stats.WrittenFiles)"
 Write-Host "Files reused         : $($stats.ReusedFiles)"
 Write-Host "Part bodies cleared  : $($stats.ClearedPartBodies)"
 Write-Host "Stripped MHTML files : $($stats.StrippedMhtmlFiles)"
+Write-Host "Skipped asset failed : $($stats.SkippedMhtmlAssetFailures)"
 Write-Host "Missing asset refs   : $($stats.MissingImgUrls)"
 Write-Host "Downloaded assets    : $($stats.DownloadedImgUrls)"
 Write-Host "Linked local videos  : $($stats.LinkedLocalVideoUrls)"
