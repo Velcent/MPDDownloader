@@ -1239,6 +1239,38 @@ function Receive-WebSocketText {
     }
 }
 
+function Receive-WebSocketTextWithTimeout {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [int]$TimeoutMilliseconds = 500
+    )
+
+    $buffer = New-Object byte[] 65536
+    $stream = New-Object System.IO.MemoryStream
+    $cts = [Threading.CancellationTokenSource]::new()
+
+    try {
+        $cts.CancelAfter($TimeoutMilliseconds)
+        do {
+            $segment = [ArraySegment[byte]]::new($buffer)
+            $result = $Socket.ReceiveAsync($segment, $cts.Token).GetAwaiter().GetResult()
+
+            if ($result.Count -gt 0) {
+                $stream.Write($buffer, 0, $result.Count)
+            }
+        } while (-not $result.EndOfMessage)
+
+        return [System.Text.Encoding]::UTF8.GetString($stream.ToArray())
+    }
+    catch [System.OperationCanceledException] {
+        return $null
+    }
+    finally {
+        $cts.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Invoke-CdpCommand {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
@@ -1392,25 +1424,6 @@ JSON.stringify({
     throw "Timeout menunggu complete: $Url"
 }
 
-function Get-AssetFetchContextUrl {
-    param(
-        [string]$Url,
-        [string]$Referrer = ''
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($Referrer) -and [Uri]::IsWellFormedUriString($Referrer, [UriKind]::Absolute)) {
-        return $Referrer
-    }
-
-    try {
-        $uri = [Uri]$Url
-        return $uri.GetLeftPart([System.UriPartial]::Authority) + '/'
-    }
-    catch {
-        return 'about:blank'
-    }
-}
-
 function ConvertTo-AssetDownloadResult {
     param(
         [byte[]]$Bytes,
@@ -1433,109 +1446,163 @@ function ConvertTo-AssetDownloadResult {
     }
 }
 
-function Invoke-FetchAssetFromCurrentPage {
+function Invoke-CdpCommandCollectEvents {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
-        [string]$Url,
-        [string]$Referrer = ''
+        [string]$Method,
+        [hashtable]$Params = @{},
+        [scriptblock]$OnEvent,
+        [int]$TimeoutSeconds = 30
     )
 
-    $urlJson = ConvertTo-Json -InputObject $Url -Compress
-    $referrerJson = ConvertTo-Json -InputObject $Referrer -Compress
-    $script = @"
-(async () => {
-    try {
-        const targetUrl = $urlJson;
-        const referrer = $referrerJson;
-        const init = { cache: 'reload', credentials: 'include' };
-        if (referrer) {
-            init.referrer = referrer;
-        }
-        const response = await fetch(targetUrl, init);
-        if (!response.ok) {
-            return JSON.stringify({ ok: false, status: response.status, statusText: response.statusText || '' });
-        }
-        const contentType = response.headers.get('content-type') || '';
-        const contentLength = response.headers.get('content-length') || '';
-        const buffer = await response.arrayBuffer();
-        if (contentLength && Number(contentLength) !== buffer.byteLength) {
-            return JSON.stringify({
-                ok: false,
-                status: response.status,
-                statusText: `content-length mismatch ${buffer.byteLength} != ${contentLength}`
-            });
-        }
-        const bytes = new Uint8Array(buffer);
-        if ((contentType || '').toLowerCase().startsWith('image/')) {
-            const blob = new Blob([bytes], { type: contentType || 'application/octet-stream' });
-            const objectUrl = URL.createObjectURL(blob);
-            try {
-                await new Promise((resolve, reject) => {
-                    const img = new Image();
-                    img.onload = () => resolve();
-                    img.onerror = () => reject(new Error('image decode failed'));
-                    img.src = objectUrl;
-                    if (img.decode) {
-                        img.decode().then(resolve).catch(reject);
-                    }
-                });
-            } finally {
-                URL.revokeObjectURL(objectUrl);
-            }
-        }
-        let binary = '';
-        const chunkSize = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunkSize) {
-            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-        }
-        return JSON.stringify({
-            ok: true,
-            status: response.status,
-            finalUrl: response.url || targetUrl,
-            contentType,
-            contentLength,
-            base64: btoa(binary)
-        });
-    } catch (error) {
-        return JSON.stringify({ ok: false, error: String(error && error.message ? error.message : error) });
-    }
-})()
-"@
+    $script:CdpCommandId++
+    $id = $script:CdpCommandId
+    $message = @{
+        id = $id
+        method = $Method
+        params = $Params
+    } | ConvertTo-Json -Depth 30 -Compress
 
-    $json = Invoke-PageEval -Socket $Socket -Expression $script
-    $data = $json | ConvertFrom-Json
-    if (-not $data.ok) {
-        if ((Test-ObjectProperty -Object $data -Name 'error') -and $data.error) {
-            throw [string]$data.error
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($message)
+    $segment = [ArraySegment[byte]]::new($bytes)
+    [void]$Socket.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $responseText = Receive-WebSocketTextWithTimeout -Socket $Socket -TimeoutMilliseconds 500
+        if ($null -eq $responseText) {
+            continue
         }
-        $status = if (Test-ObjectProperty -Object $data -Name 'status') { [string]$data.status } else { '' }
-        $statusText = if (Test-ObjectProperty -Object $data -Name 'statusText') { [string]$data.statusText } else { '' }
-        throw "HTTP $status $statusText"
+        $response = $responseText | ConvertFrom-Json
+        $responseId = if (Test-ObjectProperty -Object $response -Name 'id') { $response.id } else { $null }
+        if ($null -eq $responseId -and $OnEvent) {
+            & $OnEvent $response
+        }
+    } while ($responseId -ne $id -and (Get-Date) -lt $deadline)
+
+    if ($responseId -ne $id) {
+        throw "$Method timeout."
     }
 
-    $bytes = [Convert]::FromBase64String([string]$data.base64)
-    $expectedLength = -1
-    if ((Test-ObjectProperty -Object $data -Name 'contentLength') -and -not [string]::IsNullOrWhiteSpace([string]$data.contentLength)) {
-        [Int64]::TryParse([string]$data.contentLength, [ref]$expectedLength) | Out-Null
+    if ((Test-ObjectProperty -Object $response -Name 'error') -and $response.error) {
+        throw "$Method gagal: $($response.error.message)"
     }
 
-    return (ConvertTo-AssetDownloadResult -Bytes $bytes -ContentType ([string]$data.contentType) -FinalUrl ([string]$data.finalUrl) -ExpectedLength $expectedLength -OriginalUrl $Url)
+    return $response
 }
 
-function Get-AssetBytesWithFetchContext {
+function Wait-NetworkRequestFinished {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [hashtable]$State,
+        [int]$TimeoutSeconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ($State.Finished -or $State.Failed) {
+            return
+        }
+
+        $eventText = Receive-WebSocketTextWithTimeout -Socket $Socket -TimeoutMilliseconds 500
+        if ($null -eq $eventText) {
+            continue
+        }
+        $event = $eventText | ConvertFrom-Json
+        Update-NetworkAssetState -Event $event -State $State
+    }
+}
+
+function Update-NetworkAssetState {
+    param(
+        $Event,
+        [hashtable]$State
+    )
+
+    if (-not (Test-ObjectProperty -Object $Event -Name 'method') -or -not $Event.method) {
+        return
+    }
+
+    if ([string]$Event.method -eq 'Network.responseReceived') {
+        $params = $Event.params
+        $response = $params.response
+        $responseUrl = if ($response -and (Test-ObjectProperty -Object $response -Name 'url')) { [string]$response.url } else { '' }
+        if ($responseUrl -eq $State.Url -or (-not $State.RequestId -and $params.type -eq 'Document')) {
+            $State.RequestId = [string]$params.requestId
+            $State.ResponseUrl = $responseUrl
+            $State.ContentType = if ($response -and (Test-ObjectProperty -Object $response -Name 'mimeType')) { [string]$response.mimeType } else { '' }
+            $State.ExpectedLength = -1
+            if ($response -and (Test-ObjectProperty -Object $response -Name 'headers') -and $response.headers) {
+                foreach ($property in $response.headers.PSObject.Properties) {
+                    if ($property.Name -ieq 'content-length') {
+                        $parsedLength = [Int64]-1
+                        [Int64]::TryParse([string]$property.Value, [ref]$parsedLength) | Out-Null
+                        $State.ExpectedLength = $parsedLength
+                        break
+                    }
+                }
+            }
+        }
+    }
+    elseif ([string]$Event.method -eq 'Network.loadingFinished') {
+        if ($State.RequestId -and [string]$Event.params.requestId -eq $State.RequestId) {
+            $State.Finished = $true
+        }
+    }
+    elseif ([string]$Event.method -eq 'Network.loadingFailed') {
+        if ($State.RequestId -and [string]$Event.params.requestId -eq $State.RequestId) {
+            $State.Failed = $true
+            $State.ErrorText = if (Test-ObjectProperty -Object $Event.params -Name 'errorText') { [string]$Event.params.errorText } else { 'Network loading failed' }
+        }
+    }
+}
+
+function Get-AssetBytesFromNetworkBody {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
         [string]$Url,
-        [string]$Referrer = ''
+        $NavigateResult,
+        [hashtable]$State = $null
     )
 
-    $contextUrl = Get-AssetFetchContextUrl -Url $Url -Referrer $Referrer
-    if ($contextUrl -ne 'about:blank') {
-        [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $contextUrl })
-        [void](Wait-BrowserPageComplete -Socket $Socket -Url $contextUrl)
+    if (-not $State) {
+        $State = [hashtable]::Synchronized(@{
+            Url = $Url
+            RequestId = ''
+            ResponseUrl = ''
+            ContentType = ''
+            ExpectedLength = [Int64]-1
+            Finished = $false
+            Failed = $false
+            ErrorText = ''
+        })
     }
 
-    return (Invoke-FetchAssetFromCurrentPage -Socket $Socket -Url $Url -Referrer $Referrer)
+    if ([string]::IsNullOrWhiteSpace($State.RequestId) -and $NavigateResult -and (Test-ObjectProperty -Object $NavigateResult -Name 'result') -and (Test-ObjectProperty -Object $NavigateResult.result -Name 'loaderId')) {
+        $State.RequestId = [string]$NavigateResult.result.loaderId
+    }
+
+    Wait-NetworkRequestFinished -Socket $Socket -State $State -TimeoutSeconds $BrowserReadyTimeoutSeconds
+    if ($State.Failed) {
+        throw $State.ErrorText
+    }
+
+    if ([string]::IsNullOrWhiteSpace($State.RequestId)) {
+        throw "RequestId asset tidak ditemukan: $Url"
+    }
+
+    $bodyResponse = Invoke-CdpCommand -Socket $Socket -Method 'Network.getResponseBody' -Params @{ requestId = $State.RequestId }
+    $body = [string]$bodyResponse.result.body
+    if ([bool]$bodyResponse.result.base64Encoded) {
+        $bytes = [Convert]::FromBase64String($body)
+    }
+    else {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+    }
+
+    $contentType = if (-not [string]::IsNullOrWhiteSpace($State.ContentType)) { [string]$State.ContentType } else { Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $Url }
+    $finalUrl = if (-not [string]::IsNullOrWhiteSpace($State.ResponseUrl)) { [string]$State.ResponseUrl } else { $Url }
+    return (ConvertTo-AssetDownloadResult -Bytes $bytes -ContentType $contentType -FinalUrl $finalUrl -ExpectedLength ([Int64]$State.ExpectedLength) -OriginalUrl $Url)
 }
 
 function Set-EdgeDownloadBehavior {
@@ -1637,7 +1704,20 @@ function Get-AssetBytesWithDownloadFallback {
         if (-not [string]::IsNullOrWhiteSpace($Referrer)) {
             $params.referrer = $Referrer
         }
-        $nav = Invoke-CdpCommand -Socket $socket -Method 'Page.navigate' -Params $params
+        $networkState = [hashtable]::Synchronized(@{
+            Url = $Url
+            RequestId = ''
+            ResponseUrl = ''
+            ContentType = ''
+            ExpectedLength = [Int64]-1
+            Finished = $false
+            Failed = $false
+            ErrorText = ''
+        })
+        $nav = Invoke-CdpCommandCollectEvents -Socket $socket -Method 'Page.navigate' -Params $params -TimeoutSeconds $BrowserReadyTimeoutSeconds -OnEvent {
+            param($event)
+            Update-NetworkAssetState -Event $event -State $networkState
+        }
 
         $isDownload = $false
         if ((Test-ObjectProperty -Object $nav -Name 'result') -and (Test-ObjectProperty -Object $nav.result -Name 'isDownload')) {
@@ -1646,8 +1726,7 @@ function Get-AssetBytesWithDownloadFallback {
 
         if (-not $isDownload) {
             try {
-                [void](Wait-BrowserPageComplete -Socket $socket -Url $Url)
-                return (Invoke-FetchAssetFromCurrentPage -Socket $socket -Url $Url -Referrer $Referrer)
+                return (Get-AssetBytesFromNetworkBody -Socket $socket -Url $Url -NavigateResult $nav -State $networkState)
             }
             catch {
                 $downloadedAfterRender = Wait-DownloadedAssetFile -DownloadPath $downloadPath
@@ -1693,14 +1772,6 @@ function Get-AssetBytesWithBrowser {
         try {
             if ($attempt -gt 1) {
                 Write-Warning "Reload ulang img gagal: $Url"
-            }
-
-            try {
-                return (Get-AssetBytesWithFetchContext -Socket $socket -Url $Url -Referrer $Referrer)
-            }
-            catch {
-                $fetchError = $_.Exception.Message
-                Write-Warning "Fetch asset gagal, coba fallback download behavior: $Url - $fetchError"
             }
 
             return (Get-AssetBytesWithDownloadFallback -Session $Session -Url $Url -Referrer $Referrer)
