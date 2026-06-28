@@ -6,8 +6,8 @@ param(
     [string]$TsvPath = '',
     [string]$ErrorTsvPath = '',
     [int]$ImageDownloadAttempts = 20,
-    [int]$BrowserReadyTimeoutSeconds = 60,
-    [int]$DownloadStallTimeoutSeconds = 3,
+    [int]$BrowserReadyTimeoutSeconds = 120,
+    [int]$DownloadStallTimeoutSeconds = 60,
     [int]$FileParallelism = 1,
     [int]$AssetParallelism = 5,
     [switch]$OverwriteExistingOutput
