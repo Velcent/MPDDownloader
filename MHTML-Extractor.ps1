@@ -634,16 +634,6 @@ function Get-ContentTypeForManifestRow {
         }
     }
 
-    try {
-        $fullPath = ConvertTo-FullPath -RelativePath ([string]$Row.path)
-        if (Test-Path -LiteralPath $fullPath) {
-            $bytes = [System.IO.File]::ReadAllBytes($fullPath)
-            return Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url ([string]$Row.link)
-        }
-    }
-    catch {
-    }
-
     return Get-ContentTypeFromBytesOrUrl -Bytes ([byte[]]::new(0)) -Url ([string]$Row.link)
 }
 
@@ -2266,19 +2256,11 @@ function Import-ExistingHashMap {
             continue
         }
 
-        $fullPath = ConvertTo-FullPath -RelativePath $row.path
-        if (-not (Test-Path -LiteralPath $fullPath)) {
+        if (-not (Test-ObjectProperty -Object $row -Name 'size_bytes') -or -not $row.size_bytes) {
             continue
         }
 
-        $size = $null
-        if ((Test-ObjectProperty -Object $row -Name 'size_bytes') -and $row.size_bytes) {
-            $size = [Int64]$row.size_bytes
-        }
-        else {
-            $size = (Get-Item -LiteralPath $fullPath).Length
-        }
-
+        $size = [Int64]$row.size_bytes
         $key = "$($row.sha256.ToLowerInvariant())`t$size"
         if (-not $map.ContainsKey($key)) {
             $map[$key] = $row.path
