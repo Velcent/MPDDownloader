@@ -1316,7 +1316,10 @@ function New-AssetDownloadSession {
 
     [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
-    [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
+    [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable' -Params @{
+        maxTotalBufferSize = 1073741824   # 1 GB
+        maxResourceBufferSize = 209715200 # 200 MB
+    })
 
     return [pscustomobject]@{
         Socket = $socket
