@@ -6,8 +6,8 @@ param(
     [string]$TsvPath = '',
     [string]$ErrorTsvPath = '',
     [int]$ImageDownloadAttempts = 20,
-    [int]$BrowserReadyTimeoutSeconds = 240,
-    [int]$DownloadStallTimeoutSeconds = 120,
+    [int]$BrowserReadyTimeoutSeconds = 60,
+    [int]$DownloadStallTimeoutSeconds = 10,
     [int]$FileParallelism = 10,
     [int]$AssetParallelism = 10,
     [switch]$OverwriteExistingOutput
@@ -1965,6 +1965,7 @@ function Wait-DownloadedAssetFile {
     $stableCount = 0
     $lastPartialFile = $null
     $lastPartialLength = -1
+    $lastPartialWriteUtc = [DateTime]::MinValue
     $lastPartialProgressAt = Get-Date
 
     while ((Get-Date) -lt $deadline) {
@@ -1977,15 +1978,16 @@ function Wait-DownloadedAssetFile {
 
         if ($partialFiles.Count -gt 0) {
             $partialFile = $partialFiles[0]
-            if ($lastPartialFile -and $lastPartialFile.FullName -eq $partialFile.FullName -and $lastPartialLength -eq $partialFile.Length) {
+            if ($lastPartialFile -and $lastPartialFile.FullName -eq $partialFile.FullName -and $lastPartialLength -eq $partialFile.Length -and $lastPartialWriteUtc -eq $partialFile.LastWriteTimeUtc) {
                 $stalledFor = ((Get-Date) - $lastPartialProgressAt).TotalSeconds
                 if ($stalledFor -ge $DownloadStallTimeoutSeconds) {
-                    throw "Download temp macet/interrupted selama $([int]$stalledFor) detik: $($partialFile.Name) ($($partialFile.Length) bytes)"
+                    throw "Download temp macet/interrupted selama $([int]$stalledFor) detik: $($partialFile.Name) ($($partialFile.Length) bytes, last write $($partialFile.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')))"
                 }
             }
             else {
                 $lastPartialFile = $partialFile
                 $lastPartialLength = $partialFile.Length
+                $lastPartialWriteUtc = $partialFile.LastWriteTimeUtc
                 $lastPartialProgressAt = Get-Date
                 $deadline = (Get-Date).AddSeconds($BrowserReadyTimeoutSeconds)
             }
@@ -1993,6 +1995,7 @@ function Wait-DownloadedAssetFile {
         else {
             $lastPartialFile = $null
             $lastPartialLength = -1
+            $lastPartialWriteUtc = [DateTime]::MinValue
             $lastPartialProgressAt = Get-Date
         }
 
