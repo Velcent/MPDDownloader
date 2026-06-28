@@ -77,10 +77,53 @@ function Test-ObjectProperty {
     return @($Object.PSObject.Properties.Match($Name)).Count -gt 0
 }
 
-function Get-RelativeAssetPath {
-    param([string]$Uuid)
+function Get-AssetExtension {
+    param(
+        [string]$ContentType
+    )
 
-    return "assets/bin/$Uuid.bin"
+    $type = ''
+    if (-not [string]::IsNullOrWhiteSpace($ContentType)) {
+        $type = (($ContentType -split ';', 2)[0]).Trim().ToLowerInvariant()
+    }
+
+    switch -Regex ($type) {
+        '^image/jpeg$' { return '.jpg' }
+        '^image/png$' { return '.png' }
+        '^image/gif$' { return '.gif' }
+        '^image/webp$' { return '.webp' }
+        '^image/svg\+xml$' { return '.svg' }
+        '^image/avif$' { return '.avif' }
+        '^image/x-icon$|^image/vnd\.microsoft\.icon$' { return '.ico' }
+        '^text/css$' { return '.css' }
+        '^text/html$' { return '.html' }
+        '^text/plain$' { return '.txt' }
+        'javascript' { return '.js' }
+        'json$' { return '.json' }
+        '^video/mp4$' { return '.mp4' }
+        '^video/webm$' { return '.webm' }
+        '^font/woff2$' { return '.woff2' }
+        '^font/woff$|^application/font-woff$' { return '.woff' }
+        '^font/ttf$|^application/x-font-ttf$' { return '.ttf' }
+        '^font/otf$|^application/x-font-otf$' { return '.otf' }
+        '^application/pdf$' { return '.pdf' }
+        '^application/wasm$' { return '.wasm' }
+    }
+
+    return '.bin'
+}
+
+function Get-RelativeAssetPath {
+    param(
+        [string]$Uuid,
+        [string]$Extension = '.bin'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Extension) -or $Extension[0] -ne '.') {
+        $Extension = '.bin'
+    }
+
+    return "assets/bin/$Uuid$Extension"
 }
 
 function ConvertTo-FullPath {
@@ -2227,9 +2270,10 @@ function Register-AssetBytesInShared {
             $Shared.Stats.ReusedFiles = [Int64]$Shared.Stats.ReusedFiles + 1
         }
         else {
+            $extension = Get-AssetExtension -ContentType $ContentType
             do {
                 $uuid = New-UuidV7
-                $relativePath = Get-RelativeAssetPath -Uuid $uuid
+                $relativePath = Get-RelativeAssetPath -Uuid $uuid -Extension $extension
                 $fullPath = ConvertTo-FullPath -RelativePath $relativePath
             } while (Test-Path -LiteralPath $fullPath)
 
