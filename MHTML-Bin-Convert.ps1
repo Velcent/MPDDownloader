@@ -129,6 +129,133 @@ function Get-AssetExtension {
     return '.bin'
 }
 
+function Test-OctetStreamType {
+    param([string]$ContentType)
+
+    if ([string]::IsNullOrWhiteSpace($ContentType)) {
+        return $true
+    }
+
+    $type = (($ContentType -split ';', 2)[0]).Trim()
+    return $type -match '(?i)^application/octet-?stream$'
+}
+
+function Get-ContentTypeFromUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return ''
+    }
+
+    try {
+        $path = ([Uri]$Url).AbsolutePath.ToLowerInvariant()
+    }
+    catch {
+        $path = $Url.ToLowerInvariant()
+    }
+
+    switch -Regex ($path) {
+        '\.png$' { return 'image/png' }
+        '\.(jpg|jpeg)$' { return 'image/jpeg' }
+        '\.gif$' { return 'image/gif' }
+        '\.webp$' { return 'image/webp' }
+        '\.svg$' { return 'image/svg+xml' }
+        '\.avif$' { return 'image/avif' }
+        '\.(ico|cur)$' { return 'image/x-icon' }
+        '\.css$' { return 'text/css' }
+        '\.html?$' { return 'text/html' }
+        '\.txt$' { return 'text/plain' }
+        '\.m?js$' { return 'application/javascript' }
+        '\.json$' { return 'application/json' }
+        '\.mp4$' { return 'video/mp4' }
+        '\.webm$' { return 'video/webm' }
+        '\.woff2$' { return 'font/woff2' }
+        '\.woff$' { return 'font/woff' }
+        '\.ttf$' { return 'font/ttf' }
+        '\.otf$' { return 'font/otf' }
+        '\.pdf$' { return 'application/pdf' }
+        '\.wasm$' { return 'application/wasm' }
+    }
+
+    return ''
+}
+
+function Get-ContentTypeFromFileHeader {
+    param([string]$Path)
+
+    $bufferSize = 4096
+    $buffer = [byte[]]::new($bufferSize)
+    $stream = $null
+    try {
+        $stream = [System.IO.FileStream]::new(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read,
+            $bufferSize,
+            [System.IO.FileOptions]::SequentialScan
+        )
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+    }
+    finally {
+        if ($stream) {
+            $stream.Dispose()
+        }
+    }
+
+    if ($read -lt 4) {
+        return ''
+    }
+
+    if ($read -ge 8 -and $buffer[0] -eq 0x89 -and $buffer[1] -eq 0x50 -and $buffer[2] -eq 0x4e -and $buffer[3] -eq 0x47) { return 'image/png' }
+    if ($buffer[0] -eq 0xff -and $buffer[1] -eq 0xd8 -and $buffer[2] -eq 0xff) { return 'image/jpeg' }
+    if ($buffer[0] -eq 0x47 -and $buffer[1] -eq 0x49 -and $buffer[2] -eq 0x46) { return 'image/gif' }
+    if ($read -ge 12 -and $buffer[0] -eq 0x52 -and $buffer[1] -eq 0x49 -and $buffer[2] -eq 0x46 -and $buffer[3] -eq 0x46 -and $buffer[8] -eq 0x57 -and $buffer[9] -eq 0x45 -and $buffer[10] -eq 0x42 -and $buffer[11] -eq 0x50) { return 'image/webp' }
+    if ($read -ge 4 -and $buffer[0] -eq 0x25 -and $buffer[1] -eq 0x50 -and $buffer[2] -eq 0x44 -and $buffer[3] -eq 0x46) { return 'application/pdf' }
+    if ($read -ge 4 -and $buffer[0] -eq 0x00 -and $buffer[1] -eq 0x00 -and $buffer[2] -eq 0x01 -and $buffer[3] -eq 0x00) { return 'image/x-icon' }
+    if ($read -ge 4 -and $buffer[0] -eq 0x77 -and $buffer[1] -eq 0x4f -and $buffer[2] -eq 0x46 -and $buffer[3] -eq 0x32) { return 'font/woff2' }
+    if ($read -ge 4 -and $buffer[0] -eq 0x77 -and $buffer[1] -eq 0x4f -and $buffer[2] -eq 0x46 -and $buffer[3] -eq 0x46) { return 'font/woff' }
+    if ($read -ge 4 -and $buffer[0] -eq 0x00 -and $buffer[1] -eq 0x61 -and $buffer[2] -eq 0x73 -and $buffer[3] -eq 0x6d) { return 'application/wasm' }
+    if ($read -ge 4 -and $buffer[0] -eq 0x00 -and $buffer[1] -eq 0x01 -and $buffer[2] -eq 0x00 -and $buffer[3] -eq 0x00) { return 'font/ttf' }
+    if ($read -ge 4 -and $buffer[0] -eq 0x4f -and $buffer[1] -eq 0x54 -and $buffer[2] -eq 0x54 -and $buffer[3] -eq 0x4f) { return 'font/otf' }
+
+    $prefix = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+    if ($prefix -match '(?is)^\s*(<\?xml\b[^>]*>\s*)?<svg\b') { return 'image/svg+xml' }
+    if ($prefix -match '(?is)^\s*(<!doctype\s+html\b|<html\b)') { return 'text/html' }
+
+    if ($read -ge 12 -and $prefix.Substring(4, 4) -eq 'ftyp') {
+        $brandText = $prefix.Substring(8, [Math]::Min($read - 8, 64))
+        if ($brandText -match 'avif|avis') { return 'image/avif' }
+        if ($brandText -match 'mp4|isom|iso2|avc1|m4v') { return 'video/mp4' }
+    }
+
+    return ''
+}
+
+function Get-ResolvedContentType {
+    param(
+        [object]$Row,
+        [string]$FullPath
+    )
+
+    $rowType = if ($Row -and (Test-ObjectProperty -Object $Row -Name 'type')) { [string]$Row.type } else { '' }
+    if (-not (Test-OctetStreamType -ContentType $rowType)) {
+        return (($rowType -split ';', 2)[0]).Trim()
+    }
+
+    $detectedType = Get-ContentTypeFromFileHeader -Path $FullPath
+    if ($detectedType) {
+        return $detectedType
+    }
+
+    $urlType = if ($Row -and (Test-ObjectProperty -Object $Row -Name 'link')) { Get-ContentTypeFromUrl -Url ([string]$Row.link) } else { '' }
+    if ($urlType) {
+        return $urlType
+    }
+
+    return 'application/octet-stream'
+}
+
 function Write-ManifestFile {
     param(
         [object[]]$Rows,
@@ -190,7 +317,8 @@ foreach ($oldRelativePath in ($pathToRows.Keys | Sort-Object)) {
     }
 
     $representative = $pathToRows[$oldRelativePath][0]
-    $extension = Get-AssetExtension -ContentType ([string]$representative.type)
+    $resolvedContentType = Get-ResolvedContentType -Row $representative -FullPath $oldFullPath
+    $extension = Get-AssetExtension -ContentType $resolvedContentType
     if ($extension -ieq '.bin') {
         $skipped++
         continue
@@ -213,10 +341,13 @@ foreach ($oldRelativePath in ($pathToRows.Keys | Sort-Object)) {
 
     foreach ($row in $pathToRows[$oldRelativePath]) {
         $row.path = $newRelativePath
+        if (Test-OctetStreamType -ContentType ([string]$row.type)) {
+            $row.type = $resolvedContentType
+        }
     }
 
     $converted++
-    Write-Host "Convert: $oldRelativePath -> $newRelativePath"
+    Write-Host "Convert: $oldRelativePath -> $newRelativePath ($resolvedContentType)"
 }
 
 if (-not $WhatIf) {
