@@ -4,6 +4,7 @@ param(
     [string]$AssetsRoot = '',
     [string]$StrippedMhtmlRoot = '',
     [string]$TsvPath = '',
+    [string]$ErrorTsvPath = '',
     [int]$ImageDownloadAttempts = 20,
     [int]$BrowserReadyTimeoutSeconds = 60,
     [int]$DownloadStallTimeoutSeconds = 120,
@@ -41,6 +42,10 @@ if (-not $StrippedMhtmlRoot) {
 
 if (-not $TsvPath) {
     $TsvPath = Join-Path $AssetsRoot 'mhtml-uuid.tsv'
+}
+
+if (-not $ErrorTsvPath) {
+    $ErrorTsvPath = Join-Path $AssetsRoot 'mhtml-error.tsv'
 }
 
 $BinRoot = Join-Path $AssetsRoot 'bin'
@@ -2037,6 +2042,30 @@ function Append-ManifestRow {
     Copy-Item -LiteralPath $ManifestPath -Destination ($ManifestPath + '.bak') -Force
 }
 
+function Append-MhtmlErrorRow {
+    param(
+        [string]$ErrorPath,
+        [string]$MhtmlPath,
+        [string]$AssetUrl,
+        [string]$Reason,
+        [string]$Detail
+    )
+
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ErrorPath) | Out-Null
+    if (-not (Test-Path -LiteralPath $ErrorPath)) {
+        [System.IO.File]::WriteAllLines($ErrorPath, @("time`tfile`tasset_url`treason`tdetail"), $Utf8NoBom)
+    }
+
+    $line = @(
+        ConvertTo-TsvValue (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        ConvertTo-TsvValue $MhtmlPath
+        ConvertTo-TsvValue $AssetUrl
+        ConvertTo-TsvValue $Reason
+        ConvertTo-TsvValue $Detail
+    ) -join "`t"
+    [System.IO.File]::AppendAllText($ErrorPath, $line + "`r`n", $Utf8NoBom)
+}
+
 function Save-ManifestCache {
     param(
         [System.Collections.Generic.Dictionary[string,object]]$UrlRows,
@@ -2092,6 +2121,24 @@ function Add-SharedStat {
         }
 
         $Shared.Stats[$Name] = [Int64]$Shared.Stats[$Name] + $Amount
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($Shared.Lock)
+    }
+}
+
+function Add-MhtmlErrorFromShared {
+    param(
+        [hashtable]$Shared,
+        [string]$MhtmlPath,
+        [string]$AssetUrl,
+        [string]$Reason,
+        [string]$Detail
+    )
+
+    [System.Threading.Monitor]::Enter($Shared.Lock)
+    try {
+        Append-MhtmlErrorRow -ErrorPath $Shared.ErrorTsvPath -MhtmlPath $MhtmlPath -AssetUrl $AssetUrl -Reason $Reason -Detail $Detail
     }
     finally {
         [System.Threading.Monitor]::Exit($Shared.Lock)
@@ -2301,6 +2348,7 @@ function Process-MhtmlFile {
 
         if (-not $boundary) {
             Write-Warning "Boundary tidak ditemukan: $($File.FullName)"
+            Add-MhtmlErrorFromShared -Shared $Shared -MhtmlPath $File.FullName -AssetUrl '' -Reason 'missing_boundary' -Detail 'Boundary tidak ditemukan'
             return
         }
 
@@ -2357,6 +2405,7 @@ function Process-MhtmlFile {
                 catch {
                     Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
                     Write-Warning "Gagal download ulang body kosong: $location - $($_.Exception.Message)"
+                    Add-MhtmlErrorFromShared -Shared $Shared -MhtmlPath $File.FullName -AssetUrl $location -Reason 'empty_body_download_failed' -Detail $_.Exception.Message
                     $fileHasAssetFailure = $true
                     continue
                 }
@@ -2378,6 +2427,7 @@ function Process-MhtmlFile {
                     catch {
                         Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
                         Write-Warning "Gagal download ulang setelah decode gagal: $location - $($_.Exception.Message)"
+                        Add-MhtmlErrorFromShared -Shared $Shared -MhtmlPath $File.FullName -AssetUrl $location -Reason 'decode_failed_download_failed' -Detail $_.Exception.Message
                         $fileHasAssetFailure = $true
                         continue
                     }
@@ -2400,6 +2450,7 @@ function Process-MhtmlFile {
                     catch {
                         Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
                         Write-Warning "Gagal download ulang gambar multipart corrupt: $location - $($_.Exception.Message)"
+                        Add-MhtmlErrorFromShared -Shared $Shared -MhtmlPath $File.FullName -AssetUrl $location -Reason 'corrupt_image_download_failed' -Detail "$validationError | $($_.Exception.Message)"
                         $fileHasAssetFailure = $true
                         continue
                     }
@@ -2424,6 +2475,7 @@ function Process-MhtmlFile {
             if ([string]$assetRef.fetch_mode -eq 'local-video') {
                 $localVideoPath = Resolve-LocalVideoFilePath -Link $assetLink -VideoRoot $VideoMp4Root
                 if (-not $localVideoPath) {
+                    Add-MhtmlErrorFromShared -Shared $Shared -MhtmlPath $File.FullName -AssetUrl $assetLink -Reason 'local_video_not_found' -Detail "VideoRoot=$VideoMp4Root"
                     $fileHasAssetFailure = $true
                     continue
                 }
@@ -2449,6 +2501,7 @@ function Process-MhtmlFile {
                 }
                 catch {
                     Write-Warning "Gagal proses video lokal: $assetLink - $($_.Exception.Message)"
+                    Add-MhtmlErrorFromShared -Shared $Shared -MhtmlPath $File.FullName -AssetUrl $assetLink -Reason 'local_video_process_failed' -Detail $_.Exception.Message
                     $fileHasAssetFailure = $true
                     continue
                 }
@@ -2472,6 +2525,7 @@ function Process-MhtmlFile {
                     catch {
                         Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
                         Write-Warning "Gagal download asset tanpa multipart: $assetLink - $($_.Exception.Message)"
+                        Add-MhtmlErrorFromShared -Shared $Shared -MhtmlPath $File.FullName -AssetUrl $assetLink -Reason 'missing_asset_download_failed' -Detail $_.Exception.Message
                         $fileHasAssetFailure = $true
                         continue
                     }
@@ -2651,6 +2705,7 @@ New-Item -ItemType Directory -Force -Path $BinRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $AssetsVideoRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $StrippedMhtmlRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TsvPath) | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ErrorTsvPath) | Out-Null
 
 Write-Host "Scan input MHTML: $InputPath"
 $allFiles = @(Get-InputMhtmlFiles -Path $InputPath)
@@ -2715,6 +2770,7 @@ $shared = [hashtable]::Synchronized(@{
     Rows = $rows
     SeenRows = $seenRows
     TsvPath = $TsvPath
+    ErrorTsvPath = $ErrorTsvPath
     StrippedMhtmlRoot = $StrippedMhtmlRoot
 })
 
@@ -2757,6 +2813,7 @@ try {
                 ImageDownloadAttempts = $ImageDownloadAttempts
                 BrowserReadyTimeoutSeconds = $BrowserReadyTimeoutSeconds
                 DownloadStallTimeoutSeconds = $DownloadStallTimeoutSeconds
+                ErrorTsvPath = $ErrorTsvPath
             }
 
             Invoke-MhtmlFilesParallel -Files ([System.IO.FileInfo[]]$files.ToArray()) -InputBasePath $inputBasePath -Shared $shared -ThrottleLimit $FileParallelism -FunctionDefinitions $functionDefinitions -Context $context -OverwriteExistingOutput:$OverwriteExistingOutput
@@ -2793,6 +2850,7 @@ Write-Host "Skipped existing URL : $($stats.SkippedExistingUrls)"
 Write-Host "Skipped snapshot URL : $($stats.SkippedSnapshotParts)"
 Write-Host "Skipped non-HTTPS    : $($stats.SkippedNonHttpsParts)"
 Write-Host "Manifest             : $TsvPath"
+Write-Host "MHTML error log      : $ErrorTsvPath"
 Write-Host "Asset folder         : $BinRoot"
 Write-Host "Video folder         : $AssetsVideoRoot"
 Write-Host "Stripped MHTML folder: $StrippedMhtmlRoot"
