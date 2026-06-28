@@ -8,7 +8,7 @@ param(
     [int]$ImageDownloadAttempts = 20,
     [int]$BrowserReadyTimeoutSeconds = 120,
     [int]$DownloadStallTimeoutSeconds = 60,
-    [int]$FileParallelism = 1,
+    [int]$FileParallelism = 5,
     [int]$AssetParallelism = 5,
     [switch]$OverwriteExistingOutput
 )
@@ -1434,6 +1434,91 @@ function Close-AssetDownloadSession {
     Close-DevToolsPage -TargetId (Get-AssetSessionTargetId -Session $Session)
 }
 
+function Initialize-SharedAssetSessionPool {
+    param(
+        [hashtable]$Shared,
+        [int]$Count
+    )
+
+    if ($Shared.ContainsKey('AssetSessionPool') -and $Shared.AssetSessionPool) {
+        return
+    }
+
+    Ensure-Edge
+    $pool = [System.Collections.Concurrent.BlockingCollection[object]]::new()
+    $sessions = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+
+    try {
+        for ($i = 1; $i -le $Count; $i++) {
+            Write-Host "Buka tab asset worker $i/$Count..."
+            $session = New-AssetDownloadSession
+            [void]$sessions.Add($session)
+            $pool.Add($session)
+        }
+
+        $Shared.AssetSessionPool = $pool
+        $Shared.AssetSessions = $sessions
+    }
+    catch {
+        foreach ($session in @($sessions)) {
+            Close-AssetDownloadSession -Session $session
+        }
+
+        $pool.Dispose()
+        throw
+    }
+}
+
+function Add-SharedAssetSession {
+    param(
+        [hashtable]$Shared,
+        $Session
+    )
+
+    if (-not $Session -or -not ($Shared.ContainsKey('AssetSessions')) -or -not $Shared.AssetSessions) {
+        return
+    }
+
+    [void]$Shared.AssetSessions.Add($Session)
+}
+
+function Close-SharedAssetSessionPool {
+    param([hashtable]$Shared)
+
+    if (-not $Shared) {
+        return
+    }
+
+    $closedTargets = @{}
+    if ($Shared.ContainsKey('AssetSessions') -and $Shared.AssetSessions) {
+        foreach ($session in @($Shared.AssetSessions)) {
+            $targetId = Get-AssetSessionTargetId -Session $session
+            if ($targetId -and $closedTargets.ContainsKey($targetId)) {
+                continue
+            }
+
+            if ($targetId) {
+                $closedTargets[$targetId] = $true
+            }
+
+            Close-AssetDownloadSession -Session $session
+        }
+    }
+
+    if ($Shared.ContainsKey('AssetSessionPool') -and $Shared.AssetSessionPool) {
+        try {
+            $Shared.AssetSessionPool.Dispose()
+        }
+        catch {
+        }
+        $Shared.AssetSessionPool = $null
+    }
+
+    if ($Shared.ContainsKey('AssetSessions')) {
+        $Shared.AssetSessions = $null
+    }
+}
+
 function Wait-BrowserPageComplete {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
@@ -2317,6 +2402,71 @@ function Get-AssetBytesWithSharedSlot {
         [string]$Referrer = ''
     )
 
+    if ($Shared.ContainsKey('AssetSessionPool') -and $Shared.AssetSessionPool) {
+        $pooledSession = $null
+        try {
+            if (-not $Shared.AssetSessionPool.TryTake([ref]$pooledSession, ($BrowserReadyTimeoutSeconds * 1000))) {
+                throw "Timeout menunggu asset worker kosong: $Url"
+            }
+
+            $lastError = ''
+            for ($attempt = 1; $attempt -le $ImageDownloadAttempts; $attempt++) {
+                $assetSocket = Get-AssetSessionSocket -Session $pooledSession
+                if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                    if ($pooledSession) {
+                        Close-AssetDownloadSession -Session $pooledSession
+                    }
+                    $pooledSession = New-AssetDownloadSession
+                    Add-SharedAssetSession -Shared $Shared -Session $pooledSession
+                    $assetSocket = Get-AssetSessionSocket -Session $pooledSession
+                }
+
+                try {
+                    return (Get-AssetBytesWithBrowser -Session $pooledSession -Url $Url -Referrer $Referrer)
+                }
+                catch {
+                    $lastError = $_.Exception.Message
+                    $socketAfterError = Get-AssetSessionSocket -Session $pooledSession
+                    if ($socketAfterError -and $socketAfterError.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
+                        throw
+                    }
+
+                    Write-Warning "Session Edge asset worker mati, buat tab baru dan retry: $Url - $lastError"
+                    if ($pooledSession) {
+                        Close-AssetDownloadSession -Session $pooledSession
+                    }
+                    $pooledSession = $null
+
+                    if ($attempt -ge $ImageDownloadAttempts) {
+                        break
+                    }
+                }
+            }
+
+            throw "Download gagal setelah recreate asset worker: $Url ($lastError)"
+        }
+        finally {
+            if ((-not $pooledSession) -and $Shared.ContainsKey('AssetSessionPool') -and $Shared.AssetSessionPool) {
+                try {
+                    $pooledSession = New-AssetDownloadSession
+                    Add-SharedAssetSession -Shared $Shared -Session $pooledSession
+                }
+                catch {
+                    $pooledSession = $null
+                }
+            }
+
+            if ($pooledSession -and $Shared.ContainsKey('AssetSessionPool') -and $Shared.AssetSessionPool) {
+                try {
+                    $Shared.AssetSessionPool.Add($pooledSession)
+                }
+                catch {
+                    Close-AssetDownloadSession -Session $pooledSession
+                }
+            }
+        }
+    }
+
     [void]$Shared.AssetSemaphore.Wait()
     try {
         $lastError = ''
@@ -2689,15 +2839,9 @@ function Invoke-MhtmlFilesParallel {
         $VideoMp4Root = [string]$WorkerContext.VideoMp4Root
         $ScriptRootFull = [string]$WorkerContext.ScriptRootFull
 
-        $workerAssetSession = $null
-        try {
-            foreach ($filePath in $FilePaths) {
-                $file = Get-Item -LiteralPath $filePath
-                Process-MhtmlFile -File $file -InputBasePath $WorkerInputBasePath -Shared $WorkerShared -OverwriteExistingOutput:([bool]$WorkerOverwriteExistingOutput) -AssetSessionRef ([ref]$workerAssetSession)
-            }
-        }
-        finally {
-            Close-AssetDownloadSession -Session $workerAssetSession
+        foreach ($filePath in $FilePaths) {
+            $file = Get-Item -LiteralPath $filePath
+            Process-MhtmlFile -File $file -InputBasePath $WorkerInputBasePath -Shared $WorkerShared -OverwriteExistingOutput:([bool]$WorkerOverwriteExistingOutput)
         }
 
         return ($FilePaths -join "`n")
@@ -2825,6 +2969,8 @@ $stats.QueuedMhtmlFiles = $files.Count
 $shared = [hashtable]::Synchronized(@{
     Lock = [object]::new()
     AssetSemaphore = [System.Threading.SemaphoreSlim]::new($AssetParallelism, $AssetParallelism)
+    AssetSessionPool = $null
+    AssetSessions = $null
     Stats = $stats
     HashToPath = $hashToPath
     UrlToRow = $urlToRow
@@ -2847,20 +2993,15 @@ try {
     Write-Host "Asset parallelism    : $AssetParallelism"
 
     if ($files.Count -gt 0) {
+        Write-Host "Menyiapkan $AssetParallelism tab asset worker permanen..."
+        Initialize-SharedAssetSessionPool -Shared $shared -Count $AssetParallelism
+
         if ($FileParallelism -le 1) {
-            $singleAssetSession = $null
-            try {
-                foreach ($file in $files) {
-                    Process-MhtmlFile -File $file -InputBasePath $inputBasePath -Shared $shared -OverwriteExistingOutput:$OverwriteExistingOutput -AssetSessionRef ([ref]$singleAssetSession)
-                }
-            }
-            finally {
-                Close-AssetDownloadSession -Session $singleAssetSession
+            foreach ($file in $files) {
+                Process-MhtmlFile -File $file -InputBasePath $inputBasePath -Shared $shared -OverwriteExistingOutput:$OverwriteExistingOutput
             }
         }
         else {
-            Write-Host "Menyiapkan Edge untuk worker parallel..."
-            Ensure-Edge
             Write-Host "Menyiapkan runspace worker parallel..."
             $functionDefinitions = Get-ScriptFunctionDefinitions
             $context = @{
@@ -2882,6 +3023,7 @@ try {
     }
 }
 finally {
+    Close-SharedAssetSessionPool -Shared $shared
     Close-EdgeBrowser
     Save-ManifestCacheFromShared -Shared $shared
     if ($shared.AssetSemaphore) {
