@@ -6,8 +6,8 @@ param(
     [string]$TsvPath = '',
     [string]$ErrorTsvPath = '',
     [int]$ImageDownloadAttempts = 20,
-    [int]$BrowserReadyTimeoutSeconds = 60,
-    [int]$DownloadStallTimeoutSeconds = 20,
+    [int]$BrowserReadyTimeoutSeconds = 240,
+    [int]$DownloadStallTimeoutSeconds = 120,
     [int]$FileParallelism = 10,
     [int]$AssetParallelism = 10,
     [switch]$OverwriteExistingOutput
@@ -1284,6 +1284,21 @@ function Close-DevToolsPage {
     }
     catch {
     }
+
+    $browserSocket = $null
+    try {
+        $browserSocket = New-BrowserCdpSocket
+        [void](Invoke-CdpCommand -Socket $browserSocket -Method 'Target.closeTarget' -Params @{
+            targetId = $TargetId
+        })
+    }
+    catch {
+    }
+    finally {
+        if ($browserSocket -and $browserSocket -is [System.Net.WebSockets.ClientWebSocket]) {
+            $browserSocket.Dispose()
+        }
+    }
 }
 
 function Get-BrowserWebSocketUrl {
@@ -2002,6 +2017,16 @@ function Wait-DownloadedAssetFile {
     throw "Timeout menunggu download temp selesai setelah $BrowserReadyTimeoutSeconds detik. DownloadStallTimeoutSeconds=$DownloadStallTimeoutSeconds detik hanya aktif kalau file .crdownload/.tmp sudah muncul lalu berhenti bertambah."
 }
 
+function Test-DownloadTempRetryNeedsNewSession {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        return $false
+    }
+
+    return ($Message -match 'Timeout menunggu download temp selesai|Download temp macet/interrupted|Download temp tidak muncul')
+}
+
 function Test-DownloadTempHasFiles {
     param([string]$DownloadPath)
 
@@ -2163,6 +2188,16 @@ function Get-AssetBytesWithBrowser {
         }
         catch {
             $lastError = $_.Exception.Message
+            if (Test-DownloadTempRetryNeedsNewSession -Message $lastError) {
+                Write-Warning "Download temp timeout/stall, reset tab asset sebelum retry: $Url - $lastError"
+                try {
+                    $socket.Dispose()
+                }
+                catch {
+                }
+                break
+            }
+
             if ($socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
                 break
             }
