@@ -486,8 +486,8 @@ function ConvertTo-SafeSegment {
     $builder = [System.Text.StringBuilder]::new()
     foreach ($char in $text.ToCharArray()) {
         $code = [int][char]$char
-        if ($invalidChars.Contains($code) -or $code -lt 32) {
-            [void]$builder.Append("&#$code;")
+        if ($invalidChars.Contains($code) -or $code -lt 32 -or $char -eq ';') {
+            [void]$builder.Append("&#$code`_")
         }
         else {
             [void]$builder.Append($char)
