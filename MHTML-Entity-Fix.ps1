@@ -198,13 +198,37 @@ function Update-TsvFiles {
         $header = [string]$lines[0]
         $columns = $header -split "`t"
         $fileIndex = [Array]::IndexOf($columns, 'file')
-        $titleIndex = [Array]::IndexOf($columns, 'title')
         $saveFolderIndex = [Array]::IndexOf($columns, 'save_folder')
         $childFolderIndex = [Array]::IndexOf($columns, 'child_folder')
 
-        $isListTsv = ($fileIndex -ge 0 -and $titleIndex -ge 0)
-        $isLinkTsv = ($saveFolderIndex -ge 0 -and $childFolderIndex -ge 0)
+        $tsvName = $tsv.Name.ToLowerInvariant()
+        $isBpOrCppApi = ($tsvName -eq 'bp_api-link.tsv' -or $tsvName -eq 'bp_api-list.tsv' -or $tsvName -eq 'cpp_api-link.tsv' -or $tsvName -eq 'cpp_api-list.tsv')
+        $isLinkTsv = $tsvName.EndsWith('-link.tsv', [System.StringComparison]::OrdinalIgnoreCase)
+        $isListTsv = $tsvName.EndsWith('-list.tsv', [System.StringComparison]::OrdinalIgnoreCase)
         if (-not $isListTsv -and -not $isLinkTsv) {
+            continue
+        }
+
+        $pathColumnIndexes = [System.Collections.Generic.List[int]]::new()
+        if ($isLinkTsv) {
+            if ($saveFolderIndex -ge 0) {
+                $pathColumnIndexes.Add($saveFolderIndex) | Out-Null
+            }
+
+            if ($isBpOrCppApi) {
+                if ($childFolderIndex -ge 0) {
+                    $pathColumnIndexes.Add($childFolderIndex) | Out-Null
+                }
+            }
+            elseif ($fileIndex -ge 0) {
+                $pathColumnIndexes.Add($fileIndex) | Out-Null
+            }
+        }
+        elseif ($isListTsv -and $fileIndex -ge 0) {
+            $pathColumnIndexes.Add($fileIndex) | Out-Null
+        }
+
+        if ($pathColumnIndexes.Count -eq 0) {
             continue
         }
 
@@ -226,31 +250,9 @@ function Update-TsvFiles {
 
             $oldLine = ($parts -join "`t")
 
-            if ($isLinkTsv) {
-                foreach ($index in @($saveFolderIndex, $childFolderIndex)) {
-                    if ($index -ge 0 -and $index -lt $parts.Count) {
-                        $parts[$index] = ConvertTo-NewEntityPathValue -PathValue ([string]$parts[$index])
-                    }
-                }
-            }
-
-            if ($isListTsv -and -not [string]::IsNullOrWhiteSpace([string]$parts[$titleIndex]) -and -not [string]::IsNullOrWhiteSpace([string]$parts[$fileIndex])) {
-                $fileValue = [string]$parts[$fileIndex]
-                $directory = ''
-                $separator = '\'
-                $lastSlash = [Math]::Max($fileValue.LastIndexOf('\'), $fileValue.LastIndexOf('/'))
-                if ($lastSlash -ge 0) {
-                    $directory = $fileValue.Substring(0, $lastSlash)
-                    $separator = $fileValue.Substring($lastSlash, 1)
-                }
-
-                $directory = ConvertTo-NewEntityPathValue -PathValue $directory
-                $newFileName = "$(ConvertTo-SafeSegment -Value ([string]$parts[$titleIndex]) -MaxLength 120).mhtml"
-                if ($directory) {
-                    $parts[$fileIndex] = "$directory$separator$newFileName"
-                }
-                else {
-                    $parts[$fileIndex] = $newFileName
+            foreach ($index in $pathColumnIndexes) {
+                if ($index -ge 0 -and $index -lt $parts.Count) {
+                    $parts[$index] = ConvertTo-NewEntityPathValue -PathValue ([string]$parts[$index])
                 }
             }
 
@@ -433,3 +435,4 @@ if ($WhatIf) {
 else {
     Write-Host "Selesai. Item direname: $($renames.Count). TSV diupdate: $updatedTsvCount."
 }
+pause
