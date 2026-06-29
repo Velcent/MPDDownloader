@@ -55,7 +55,7 @@ function Invoke-OptimiztFile {
     $arguments.Add('-o') | Out-Null
     $arguments.Add($TargetDirectory) | Out-Null
     $arguments.Add($File.DirectoryName) | Out-Null
-    $arguments.Add($File.FullName) | Out-Null
+    $arguments.Add($File.Name) | Out-Null
 
     if ($WhatIf) {
         Write-Host "WHATIF optimizt $($arguments -join ' ')"
