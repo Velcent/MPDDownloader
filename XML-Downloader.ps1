@@ -9,6 +9,7 @@ param(
     [switch]$Doc,
     [switch]$Learn,
     [string]$Custom = '',
+    [switch]$LoadImages,
     [switch]$DryRun,
     [switch]$NoPause,
     [switch]$WorkerMode,
@@ -303,7 +304,7 @@ function Invoke-CdpCommand {
         $responseText = Receive-WebSocketText $Socket
         $response = $responseText | ConvertFrom-Json
         if (-not $response.id) {
-            Update-NetworkStateFromEvent -Message $response
+            Handle-CdpEvent -Socket $Socket -Message $response
         }
     } while ($response.id -ne $id)
 
@@ -312,6 +313,25 @@ function Invoke-CdpCommand {
     }
 
     return $response
+}
+
+function Send-CdpCommandNoWait {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$Method,
+        [hashtable]$Params = @{}
+    )
+
+    $script:CdpCommandId++
+    $message = @{
+        id = $script:CdpCommandId
+        method = $Method
+        params = $Params
+    } | ConvertTo-Json -Depth 30 -Compress
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($message)
+    $segment = [ArraySegment[byte]]::new($bytes)
+    [void]$Socket.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
 }
 
 function Reset-NetworkState {
@@ -351,6 +371,48 @@ function Update-NetworkStateFromEvent {
                 $script:MainDocumentRequestId = $requestId
             }
             $script:MainDocumentFailedText = $errorText
+        }
+    }
+}
+
+function Handle-CdpEvent {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        $Message
+    )
+
+    Update-NetworkStateFromEvent -Message $Message
+
+    if ($Message -and $Message.method -eq 'Fetch.requestPaused') {
+        $requestId = [string]$Message.params.requestId
+        if ([string]::IsNullOrWhiteSpace($requestId)) {
+            return
+        }
+
+        $resourceType = [string]$Message.params.resourceType
+        $requestUrl = [string]$Message.params.request.url
+        $shouldBlock = -not $LoadImages -and (
+            $resourceType -eq 'Image' -or
+            $requestUrl -match '(?i)/community/api/(learning|documentation|user_profiles)/image/' -or
+            $requestUrl -match '(?i)[?&]resizing_type='
+        )
+
+        $method = if ($shouldBlock) { 'Fetch.failRequest' } else { 'Fetch.continueRequest' }
+        $params = if ($shouldBlock) {
+            @{
+                requestId = $requestId
+                errorReason = 'BlockedByClient'
+            }
+        }
+        else {
+            @{ requestId = $requestId }
+        }
+
+        try {
+            Send-CdpCommandNoWait -Socket $Socket -Method $method -Params $params
+        }
+        catch {
+            Write-Warning "Fetch handler gagal untuk ${requestUrl}: $($_.Exception.Message)"
         }
     }
 }
@@ -853,6 +915,16 @@ function New-LearningPageSession {
     [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
+    if (-not $LoadImages) {
+        [void](Invoke-CdpCommand -Socket $socket -Method 'Fetch.enable' -Params @{
+            patterns = @(
+                @{
+                    urlPattern = '*'
+                    requestStage = 'Request'
+                }
+            )
+        })
+    }
 
     return [pscustomobject]@{
         Socket = $socket
@@ -1487,20 +1559,27 @@ function Start-LearningWorkerJob {
             [double]$PageIdleSeconds,
             [int]$PageLoadTimeoutSeconds,
             [int]$MaxLoadAttempts,
-            [string]$MhtmlRoot
+            [string]$MhtmlRoot,
+            [bool]$LoadImages
         )
 
-        & $ScriptPath `
-            -WorkerMode `
-            -WorkerTaskKind $TaskKind `
-            -WorkerBrowserPort $BrowserPort `
-            -WorkerId $Id `
-            -WorkerIpcDir $IpcDir `
-            -BrowserPollSeconds $BrowserPollSeconds `
-            -PageIdleSeconds $PageIdleSeconds `
-            -PageLoadTimeoutSeconds $PageLoadTimeoutSeconds `
-            -MaxLoadAttempts $MaxLoadAttempts `
-            -MhtmlRoot $MhtmlRoot
+        $arguments = @(
+            '-WorkerMode',
+            '-WorkerTaskKind', $TaskKind,
+            '-WorkerBrowserPort', $BrowserPort,
+            '-WorkerId', $Id,
+            '-WorkerIpcDir', $IpcDir,
+            '-BrowserPollSeconds', $BrowserPollSeconds,
+            '-PageIdleSeconds', $PageIdleSeconds,
+            '-PageLoadTimeoutSeconds', $PageLoadTimeoutSeconds,
+            '-MaxLoadAttempts', $MaxLoadAttempts,
+            '-MhtmlRoot', $MhtmlRoot
+        )
+        if ($LoadImages) {
+            $arguments += '-LoadImages'
+        }
+
+        & $ScriptPath @arguments
     } -ArgumentList @(
         $scriptPath,
         $script:BrowserPort,
@@ -1511,7 +1590,8 @@ function Start-LearningWorkerJob {
         $PageIdleSeconds,
         $PageLoadTimeoutSeconds,
         $MaxLoadAttempts,
-        $MhtmlRoot
+        $MhtmlRoot,
+        [bool]$LoadImages
     )
 }
 
