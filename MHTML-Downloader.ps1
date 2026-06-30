@@ -1024,11 +1024,27 @@ function ConvertTo-SafeSegment {
     return $text
 }
 
+function Test-LearningXmlSource {
+    param([string]$SourceXml)
+
+    if ([string]::IsNullOrWhiteSpace($SourceXml)) {
+        return $false
+    }
+
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($SourceXml)
+    return $baseName -in @('LearnMH', 'LearnUE', 'LearnFN')
+}
+
 function Get-IndexedSegment {
     param(
         [int]$Index,
-        [string]$Title
+        [string]$Title,
+        [string]$SourceXml = ''
     )
+
+    if (Test-LearningXmlSource -SourceXml $SourceXml) {
+        return (ConvertTo-SafeSegment -Value $Title -MaxLength 100)
+    }
 
     return ('{0}. {1}' -f $Index, (ConvertTo-SafeSegment -Value $Title -MaxLength 100))
 }
@@ -1353,7 +1369,7 @@ function Add-NavDivTask {
         $title = $url
     }
 
-    $segment = Get-IndexedSegment -Index $Index -Title $title
+    $segment = Get-IndexedSegment -Index $Index -Title $title -SourceXml $SourceXml
     $nodeFolder = [System.IO.Path]::GetFullPath((Join-Path $ParentFolder $segment))
     $filePath = Join-Path $ParentFolder "$segment.mhtml"
 
@@ -1406,7 +1422,20 @@ function Get-XmlDownloadTasks {
     }
 
     $tasks = New-Object System.Collections.ArrayList
-    $xmlFiles = @(Get-ChildItem -LiteralPath $Root -File -Filter '*.xml' | Sort-Object Name)
+    $directXmlFiles = @(Get-ChildItem -LiteralPath $Root -File -Filter '*.xml')
+    $xmlNameMap = @{}
+    foreach ($file in $directXmlFiles) {
+        $xmlNameMap[$file.Name.ToLowerInvariant()] = $true
+    }
+
+    $xmlFiles = @($directXmlFiles | Where-Object {
+        $name = $_.Name.ToLowerInvariant()
+        -not (
+            ($name -eq 'learnue-list.xml' -and $xmlNameMap.ContainsKey('learnue.xml')) -or
+            ($name -eq 'learnmh-list.xml' -and $xmlNameMap.ContainsKey('learnmh.xml')) -or
+            ($name -eq 'learnfn-list.xml' -and $xmlNameMap.ContainsKey('learnfn.xml'))
+        )
+    } | Sort-Object Name)
     Write-Host "XML langsung di folder mhtml: $($xmlFiles.Count) file"
 
     foreach ($xmlFile in $xmlFiles) {

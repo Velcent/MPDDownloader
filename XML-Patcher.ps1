@@ -1,6 +1,6 @@
 param(
     [string]$MhtmlRoot = (Join-Path $PSScriptRoot 'mhtml'),
-    [string[]]$Keys = @('LearnUE', 'LearnMH'),
+    [string[]]$Keys = @('LearnUE', 'LearnMH', 'LearnFN'),
     [switch]$NoBackup,
     [switch]$NoPause
 )

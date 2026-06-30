@@ -52,6 +52,13 @@ $LearningTargets = @(
         RootUrl = 'https://dev.epicgames.com/community/metahuman/learning'
         OutputPath = (Join-Path $MhtmlRoot 'LearnMH.xml')
         ListOutputPath = (Join-Path $MhtmlRoot 'LearnMH-list.xml')
+    },
+    [pscustomobject]@{
+        Key = 'LearnFN'
+        Title = 'Fortnite Learning'
+        RootUrl = 'https://dev.epicgames.com/community/fortnite/learning'
+        OutputPath = (Join-Path $MhtmlRoot 'LearnFN.xml')
+        ListOutputPath = (Join-Path $MhtmlRoot 'LearnFN-list.xml')
     }
 )
 
