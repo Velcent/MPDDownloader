@@ -2,7 +2,7 @@ param(
     [string]$MhtmlRoot = (Join-Path $PSScriptRoot 'mhtml'),
     [int]$BrowserPollSeconds = 1,
     [double]$PageIdleSeconds = 0.1,
-    [int]$PageLoadTimeoutSeconds = 3000,
+    [int]$PageLoadTimeoutSeconds = 300,
     [int]$MaxLoadAttempts = 100000,
     [int]$ParallelPages = 5,
     [int]$MaxPages = 0,

@@ -1630,6 +1630,15 @@ function ConvertTo-LearningXml {
     [void]$lines.Add(('<div class="contents-table-el is-active is-root-entry"><a class="contents-table-link is-parent" href="{0}">{1}</a></div>' -f (ConvertTo-XmlAttributeValue $Target.RootUrl), (ConvertTo-XmlAttributeValue $Target.Title)))
     [void]$lines.Add('<ul class="contents-table-list">')
 
+    $parentUrlKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in @($Items)) {
+        $url = [string]$item.url
+        if (-not [string]::IsNullOrWhiteSpace($url)) {
+            [void]$parentUrlKeys.Add((Get-CanonicalUrlKey -PageUrl $url))
+        }
+    }
+
+    $parentTitleCounts = @{}
     foreach ($item in @($Items)) {
         if (-not $item -or [string]::IsNullOrWhiteSpace([string]$item.url)) {
             continue
@@ -1640,12 +1649,26 @@ function ConvertTo-LearningXml {
             $title = [string]$item.url
         }
 
+        $titleKey = $title.ToLowerInvariant()
+        if ($parentTitleCounts.ContainsKey($titleKey)) {
+            $parentTitleCounts[$titleKey]++
+            $title = "$title`_$($parentTitleCounts[$titleKey])"
+        }
+        else {
+            $parentTitleCounts[$titleKey] = 0
+        }
+
         $href = ConvertTo-XmlAttributeValue ([string]$item.url)
         $label = ConvertTo-XmlAttributeValue $title
-        $children = @($item.children)
+        $publishedAt = ConvertTo-XmlAttributeValue ([string]$item.publishedAt)
+        $publishedTimestamp = ConvertTo-XmlAttributeValue ([string]$item.publishedTimestamp)
+        $children = @($item.children | Where-Object {
+            $childUrl = [string]$_.url
+            -not [string]::IsNullOrWhiteSpace($childUrl) -and -not $parentUrlKeys.Contains((Get-CanonicalUrlKey -PageUrl $childUrl))
+        })
         $linkClass = if ($children.Count -gt 0) { 'contents-table-link is-parent' } else { 'contents-table-link' }
         [void]$lines.Add("`t<li class=""contents-table-item"">")
-        [void]$lines.Add("`t`t<div class=""contents-table-el""><a class=""$linkClass"" href=""$href"">$label</a></div>")
+        [void]$lines.Add("`t`t<div class=""contents-table-el"" data-published-at=""$publishedAt"" data-published-timestamp=""$publishedTimestamp""><a class=""$linkClass"" href=""$href"">$label</a></div>")
         if ($children.Count -gt 0) {
             [void]$lines.Add("`t`t<ul class=""contents-table-list"">")
             foreach ($child in $children) {
@@ -1684,6 +1707,9 @@ function ConvertTo-LearningListXml {
             continue
         }
 
+        $publishedAt = ConvertTo-XmlAttributeValue ([string]$item.publishedAt)
+        $publishedTimestamp = ConvertTo-XmlAttributeValue ([string]$item.publishedTimestamp)
+        [void]$lines.Add("<!-- published_at=""$publishedAt"" published_timestamp=""$publishedTimestamp"" -->")
         [void]$lines.Add($html)
     }
 
@@ -1732,9 +1758,21 @@ function Get-LearningListCacheItems {
         return @()
     }
 
+    $pendingPublishedAt = ''
+    $pendingPublishedTimestamp = 0
     foreach ($line in Get-Content -LiteralPath $Path) {
         $html = [string]$line
         if ([string]::IsNullOrWhiteSpace($html)) {
+            continue
+        }
+
+        $commentMatch = [regex]::Match($html, '<!--\s*published_at="([^"]*)"\s+published_timestamp="([^"]*)"\s*-->', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($commentMatch.Success) {
+            $pendingPublishedAt = [System.Net.WebUtility]::HtmlDecode([string]$commentMatch.Groups[1].Value)
+            $timestampText = [string]$commentMatch.Groups[2].Value
+            $timestampValue = 0.0
+            [double]::TryParse($timestampText, [ref]$timestampValue) | Out-Null
+            $pendingPublishedTimestamp = $timestampValue
             continue
         }
 
@@ -1746,7 +1784,11 @@ function Get-LearningListCacheItems {
         [void]$items.Add([pscustomobject]@{
             url = $url
             html = $html
+            publishedAt = $pendingPublishedAt
+            publishedTimestamp = $pendingPublishedTimestamp
         })
+        $pendingPublishedAt = ''
+        $pendingPublishedTimestamp = 0
     }
 
     return @($items)
@@ -1778,8 +1820,8 @@ function ConvertFrom-LearningXmlLi {
         url = [string]$anchor.GetAttribute('href')
         originalUrl = ''
         html = ''
-        publishedAt = ''
-        publishedTimestamp = 0
+        publishedAt = [string]$anchor.ParentNode.GetAttribute('data-published-at')
+        publishedTimestamp = if ([string]::IsNullOrWhiteSpace([string]$anchor.ParentNode.GetAttribute('data-published-timestamp'))) { 0 } else { [double]$anchor.ParentNode.GetAttribute('data-published-timestamp') }
         children = @($children)
     }
 }
@@ -1827,6 +1869,12 @@ function Get-LearningCache {
         if ($index -lt $listItems.Count) {
             $item.originalUrl = [string]$listItems[$index].url
             $item.html = [string]$listItems[$index].html
+            if ([string]::IsNullOrWhiteSpace([string]$item.publishedAt)) {
+                $item.publishedAt = [string]$listItems[$index].publishedAt
+            }
+            if ([double]$item.publishedTimestamp -le 0 -and [double]$listItems[$index].publishedTimestamp -gt 0) {
+                $item.publishedTimestamp = [double]$listItems[$index].publishedTimestamp
+            }
         }
 
         if (-not [string]::IsNullOrWhiteSpace([string]$item.originalUrl)) {
@@ -1845,6 +1893,16 @@ function Get-LearningCache {
     }
 }
 
+function Test-LearningItemHasTimestamp {
+    param($Item)
+
+    if (-not $Item) {
+        return $false
+    }
+
+    return [double]$Item.publishedTimestamp -gt 0
+}
+
 function Merge-LearningScanWithCache {
     param(
         [object[]]$ScannedItems,
@@ -1852,9 +1910,11 @@ function Merge-LearningScanWithCache {
     )
 
     $newItems = New-Object System.Collections.ArrayList
+    $timestampItems = New-Object System.Collections.ArrayList
     $newByOriginal = @{}
     $merged = New-Object System.Collections.ArrayList
     $usedFinalKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $queuedTimestampKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($item in @($ScannedItems)) {
         $url = [string]$item.url
@@ -1872,15 +1932,30 @@ function Merge-LearningScanWithCache {
         }
 
         if ($cached) {
+            if (-not (Test-LearningItemHasTimestamp -Item $cached) -and -not $queuedTimestampKeys.Contains($key)) {
+                [void]$timestampItems.Add([pscustomobject]@{
+                    title = if ([string]::IsNullOrWhiteSpace([string]$item.title)) { [string]$cached.title } else { [string]$item.title }
+                    url = if ([string]::IsNullOrWhiteSpace([string]$item.url)) { if ([string]::IsNullOrWhiteSpace([string]$cached.originalUrl)) { [string]$cached.url } else { [string]$cached.originalUrl } } else { [string]$item.url }
+                    html = if ([string]::IsNullOrWhiteSpace([string]$item.html)) { [string]$cached.html } else { [string]$item.html }
+                })
+                [void]$queuedTimestampKeys.Add($key)
+            }
             continue
         }
 
         [void]$newItems.Add($item)
     }
 
-    if ($newItems.Count -gt 0) {
-        Write-Host "Detail scan link baru: $($newItems.Count)"
-        $newEnrichedItems = @(Invoke-LearningDetailScan -Items @($newItems))
+    $detailItems = @($newItems) + @($timestampItems)
+    if ($detailItems.Count -gt 0) {
+        if ($newItems.Count -gt 0) {
+            Write-Host "Detail scan link baru: $($newItems.Count)"
+        }
+        if ($timestampItems.Count -gt 0) {
+            Write-Host "Detail scan timestamp kosong: $($timestampItems.Count)"
+        }
+
+        $newEnrichedItems = @(Invoke-LearningDetailScan -Items @($detailItems))
         foreach ($item in @($newEnrichedItems)) {
             $originalUrl = [string]$item.originalUrl
             if (-not [string]::IsNullOrWhiteSpace($originalUrl)) {
@@ -1892,20 +1967,20 @@ function Merge-LearningScanWithCache {
         }
     }
     else {
-        Write-Host "Tidak ada link baru untuk detail scan."
+        Write-Host "Tidak ada link baru atau timestamp kosong untuk detail scan."
     }
 
     foreach ($item in @($ScannedItems)) {
         $key = Get-CanonicalUrlKey -PageUrl ([string]$item.url)
         $enriched = $null
-        if ($Cache.ByOriginal.ContainsKey($key)) {
+        if ($newByOriginal.ContainsKey($key)) {
+            $enriched = $newByOriginal[$key]
+        }
+        elseif ($Cache.ByOriginal.ContainsKey($key)) {
             $enriched = $Cache.ByOriginal[$key]
         }
         elseif ($Cache.ByFinal.ContainsKey($key)) {
             $enriched = $Cache.ByFinal[$key]
-        }
-        elseif ($newByOriginal.ContainsKey($key)) {
-            $enriched = $newByOriginal[$key]
         }
 
         if (-not $enriched) {
@@ -1931,6 +2006,7 @@ function Merge-LearningScanWithCache {
     return [pscustomobject]@{
         Items = @($merged)
         NewCount = $newItems.Count
+        TimestampUpdateCount = $timestampItems.Count
     }
 }
 
@@ -2331,6 +2407,13 @@ function Invoke-LearningTargetScan {
 if ($BuildLearn) {
     foreach ($target in $LearningTargets) {
         Write-Host ""
+        $cache = Get-LearningCache -Target $target
+        $missingTimestampCount = @($cache.Items | Where-Object { -not (Test-LearningItemHasTimestamp -Item $_) }).Count
+        $target | Add-Member -NotePropertyName Cache -NotePropertyValue $cache -Force
+        if ($cache.Items.Count -gt 0) {
+            Write-Host "Resume cache $($target.Key): $($cache.Items.Count) item XML, $($cache.ListItems.Count) item list, $missingTimestampCount timestamp kosong"
+        }
+
         $learningRootUrl = ConvertTo-LearningRootUrl -RootUrl $target.RootUrl
         Write-Host "Baca root: $learningRootUrl"
         $rootData = Get-LearningPageData -PageUrl $learningRootUrl
@@ -2367,19 +2450,35 @@ if ($DryRun) {
 
 if ($BuildLearn) {
     foreach ($target in $LearningTargets) {
-        $scanResult = Invoke-LearningTargetScan -Target $target
-        $cache = Get-LearningCache -Target $target
-        if ($cache.Items.Count -gt 0) {
-            Write-Host "Cache $($target.Key): $($cache.Items.Count) item XML, $($cache.ListItems.Count) item list"
+        $cache = $target.Cache
+        if (-not $cache) {
+            $cache = Get-LearningCache -Target $target
         }
+
+        $missingTimestampCount = @($cache.Items | Where-Object { -not (Test-LearningItemHasTimestamp -Item $_) }).Count
+        $cacheHasAllLinks = $cache.Items.Count -gt 0 -and [int]$target.TotalResults -gt 0 -and $cache.Items.Count -ge [int]$target.TotalResults
+        if ($cacheHasAllLinks) {
+            Write-Host ""
+            Write-Host "Cache $($target.Key) sudah memenuhi total link ($($cache.Items.Count)/$($target.TotalResults)); skip scan page list."
+            $scanResult = [pscustomobject]@{
+                Items = @($cache.Items)
+                TotalResults = [int]$target.TotalResults
+                TotalPages = [int]$target.TotalPages
+                Passes = 0
+            }
+        }
+        else {
+            $scanResult = Invoke-LearningTargetScan -Target $target
+        }
+
         $mergeResult = Merge-LearningScanWithCache -ScannedItems @($scanResult.Items) -Cache $cache
         $items = @($mergeResult.Items)
         $xmlLines = ConvertTo-LearningXml -Target $target -Items $items
         $listXmlLines = ConvertTo-LearningListXml -Items $items
         Set-Content -LiteralPath $target.OutputPath -Value $xmlLines -Encoding UTF8
         Set-Content -LiteralPath $target.ListOutputPath -Value $listXmlLines -Encoding UTF8
-        Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($($items.Count)/$($scanResult.TotalResults) link unik, $($mergeResult.NewCount) link baru, $($scanResult.Passes) pass)"
-        Write-Host "Tulis XML list: $(ConvertTo-RelativeRootPath $target.ListOutputPath) ($($listXmlLines.Count) li unik)"
+        Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($($items.Count)/$($scanResult.TotalResults) link unik, $($mergeResult.NewCount) link baru, $($mergeResult.TimestampUpdateCount) timestamp kosong, $($scanResult.Passes) pass)"
+        Write-Host "Tulis XML list: $(ConvertTo-RelativeRootPath $target.ListOutputPath) ($($items.Count) li unik)"
     }
 }
 
