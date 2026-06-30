@@ -12,6 +12,8 @@ param(
     [switch]$DryRun,
     [switch]$NoPause,
     [switch]$WorkerMode,
+    [ValidateSet('Page', 'Detail')]
+    [string]$WorkerTaskKind = 'Page',
     [int]$WorkerBrowserPort = 0,
     [int]$WorkerId = 0,
     [string]$WorkerIpcDir = ''
@@ -1003,7 +1005,7 @@ function Get-LearningDetailDataInSession {
     throw "Gagal membaca halaman detail learning: $PageUrl"
 }
 
-function Invoke-LearningDetailScan {
+function Invoke-SerialLearningDetailScan {
     param([object[]]$Items)
 
     $session = $null
@@ -1061,6 +1063,16 @@ function Invoke-LearningDetailScan {
     }
 
     return @($enriched | Sort-Object @{ Expression = { [double]$_.publishedTimestamp }; Descending = $true }, @{ Expression = { [string]$_.title }; Ascending = $true })
+}
+
+function Invoke-LearningDetailScan {
+    param([object[]]$Items)
+
+    if ($ParallelPages -le 1 -or @($Items).Count -le 1) {
+        return @(Invoke-SerialLearningDetailScan -Items $Items)
+    }
+
+    return @(Invoke-ParallelLearningDetailReads -Items $Items)
 }
 
 function Wait-DocumentationPageReady {
@@ -1220,6 +1232,63 @@ function New-WorkerErrorResult {
     }
 }
 
+function New-WorkerDetailSuccessResult {
+    param(
+        [int]$Id,
+        [int]$TaskId,
+        [int]$ItemIndex,
+        [string]$OriginalUrl,
+        [string]$FallbackTitle,
+        [string]$Html,
+        $Detail
+    )
+
+    $finalUrl = if ($Detail -and -not [string]::IsNullOrWhiteSpace([string]$Detail.FinalUrl)) { [string]$Detail.FinalUrl } else { $OriginalUrl }
+    $title = ConvertTo-SafeText $FallbackTitle
+    if ($Detail -and -not [string]::IsNullOrWhiteSpace([string]$Detail.Title)) {
+        $title = ConvertTo-SafeText ([string]$Detail.Title)
+    }
+    if ([string]::IsNullOrWhiteSpace($title)) {
+        $title = $finalUrl
+    }
+
+    return [pscustomobject]@{
+        WorkerResult = $true
+        WorkerId = $Id
+        TaskId = $TaskId
+        Success = $true
+        ItemIndex = $ItemIndex
+        title = $title
+        url = $finalUrl
+        originalUrl = $OriginalUrl
+        html = $Html
+        publishedAt = if ($Detail) { [string]$Detail.PublishedAt } else { '' }
+        publishedTimestamp = if ($Detail) { [double]$Detail.PublishedTimestamp } else { 0 }
+        children = if ($Detail) { @($Detail.Children) } else { @() }
+        Error = ''
+    }
+}
+
+function New-WorkerDetailErrorResult {
+    param(
+        [int]$Id,
+        [int]$TaskId,
+        [int]$ItemIndex,
+        [string]$OriginalUrl,
+        [string]$ErrorMessage
+    )
+
+    return [pscustomobject]@{
+        WorkerResult = $true
+        WorkerId = $Id
+        TaskId = $TaskId
+        Success = $false
+        ItemIndex = $ItemIndex
+        originalUrl = $OriginalUrl
+        Error = $ErrorMessage
+    }
+}
+
 function Invoke-PersistentLearningWorker {
     param(
         [int]$Id,
@@ -1299,19 +1368,101 @@ function Invoke-PersistentLearningWorker {
     }
 }
 
+function Invoke-PersistentLearningDetailWorker {
+    param(
+        [int]$Id,
+        [string]$Directory
+    )
+
+    $workerDir = [System.IO.Path]::GetFullPath($Directory)
+    $taskPath = Get-WorkerFilePath -Directory $workerDir -Id $Id -Kind 'task.json'
+    $processingPath = Get-WorkerFilePath -Directory $workerDir -Id $Id -Kind 'processing.json'
+    $resultPath = Get-WorkerFilePath -Directory $workerDir -Id $Id -Kind 'result.json'
+    $stopPath = Get-WorkerFilePath -Directory $workerDir -Id $Id -Kind 'stop'
+
+    $session = $null
+    try {
+        $session = New-LearningPageSession
+        Write-Host "Detail worker #$Id siap menunggu task."
+
+        while ($true) {
+            if ((Test-Path -LiteralPath $stopPath) -and -not (Test-Path -LiteralPath $taskPath) -and -not (Test-Path -LiteralPath $processingPath)) {
+                break
+            }
+
+            $currentTaskPath = $null
+            if (Test-Path -LiteralPath $processingPath) {
+                $currentTaskPath = $processingPath
+            }
+            elseif (Test-Path -LiteralPath $taskPath) {
+                try {
+                    Move-Item -LiteralPath $taskPath -Destination $processingPath -Force -ErrorAction Stop
+                    $currentTaskPath = $processingPath
+                }
+                catch {
+                    Start-Sleep -Milliseconds 250
+                    continue
+                }
+            }
+
+            if (-not $currentTaskPath) {
+                Start-Sleep -Milliseconds 250
+                continue
+            }
+
+            $taskId = 0
+            $itemIndex = 0
+            $pageUrl = ''
+            try {
+                $task = Get-Content -LiteralPath $currentTaskPath -Raw | ConvertFrom-Json
+                $taskId = [int]$task.TaskId
+                $itemIndex = [int]$task.ItemIndex
+                $pageUrl = [string]$task.Url
+                $fallbackTitle = [string]$task.Title
+                $html = [string]$task.Html
+
+                if (-not $session -or $session.Socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                    Close-LearningPageSession -Session $session
+                    $session = New-LearningPageSession
+                }
+
+                $detail = Get-LearningDetailDataInSession -Socket $session.Socket -PageUrl $pageUrl
+                $result = New-WorkerDetailSuccessResult -Id $Id -TaskId $taskId -ItemIndex $itemIndex -OriginalUrl $pageUrl -FallbackTitle $fallbackTitle -Html $html -Detail $detail
+            }
+            catch {
+                $result = New-WorkerDetailErrorResult -Id $Id -TaskId $taskId -ItemIndex $itemIndex -OriginalUrl $pageUrl -ErrorMessage $_.Exception.Message
+            }
+
+            $tempResultPath = "$resultPath.tmp"
+            $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $tempResultPath -Encoding UTF8
+            Move-Item -LiteralPath $tempResultPath -Destination $resultPath -Force
+            Remove-Item -LiteralPath $currentTaskPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    finally {
+        Close-LearningPageSession -Session $session
+    }
+}
+
 if ($WorkerMode) {
-    Invoke-PersistentLearningWorker -Id $WorkerId -Directory $WorkerIpcDir
+    if ($WorkerTaskKind -eq 'Detail') {
+        Invoke-PersistentLearningDetailWorker -Id $WorkerId -Directory $WorkerIpcDir
+    }
+    else {
+        Invoke-PersistentLearningWorker -Id $WorkerId -Directory $WorkerIpcDir
+    }
     return
 }
 
 function Start-LearningWorkerJob {
     param(
         [int]$Id,
-        [string]$IpcDir
+        [string]$IpcDir,
+        [string]$TaskKind = 'Page'
     )
 
     Ensure-Edge
-    Write-Host "Mulai worker #${Id}"
+    Write-Host "Mulai $TaskKind worker #${Id}"
 
     $scriptPath = $PSCommandPath
     $initialization = {
@@ -1324,6 +1475,7 @@ function Start-LearningWorkerJob {
             [int]$BrowserPort,
             [int]$Id,
             [string]$IpcDir,
+            [string]$TaskKind,
             [int]$BrowserPollSeconds,
             [double]$PageIdleSeconds,
             [int]$PageLoadTimeoutSeconds,
@@ -1333,6 +1485,7 @@ function Start-LearningWorkerJob {
 
         & $ScriptPath `
             -WorkerMode `
+            -WorkerTaskKind $TaskKind `
             -WorkerBrowserPort $BrowserPort `
             -WorkerId $Id `
             -WorkerIpcDir $IpcDir `
@@ -1346,6 +1499,7 @@ function Start-LearningWorkerJob {
         $script:BrowserPort,
         $Id,
         $IpcDir,
+        $TaskKind,
         $BrowserPollSeconds,
         $PageIdleSeconds,
         $PageLoadTimeoutSeconds,
@@ -1386,6 +1540,33 @@ function Send-TaskToWorker {
     $Worker.Task = $Task
     $Worker.TaskId = $TaskId
     Write-Host "Worker #$($Worker.Id) proses page $($Task.Page): $($Task.Url)"
+}
+
+function Send-DetailTaskToWorker {
+    param(
+        $Worker,
+        $Item,
+        [int]$ItemIndex,
+        [int]$TaskId
+    )
+
+    $payload = [pscustomobject]@{
+        TaskId = $TaskId
+        ItemIndex = $ItemIndex
+        Url = [string]$Item.url
+        Title = [string]$Item.title
+        Html = [string]$Item.html
+    }
+
+    $tempPath = "$($Worker.TaskPath).tmp"
+    $payload | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+    Move-Item -LiteralPath $tempPath -Destination $Worker.TaskPath -Force
+
+    $Worker.Busy = $true
+    $Worker.Task = $Item
+    $Worker.TaskId = $TaskId
+    $Worker.ItemIndex = $ItemIndex
+    Write-Host "Detail worker #$($Worker.Id) proses $ItemIndex/$($Worker.TotalItems): $($Item.url)"
 }
 
 function Receive-WorkerResult {
@@ -1931,6 +2112,125 @@ function Invoke-ParallelPageReads {
     }
 
     return @($results)
+}
+
+function Invoke-ParallelLearningDetailReads {
+    param([object[]]$Items)
+
+    $itemList = @($Items)
+    $results = New-Object System.Collections.ArrayList
+    if ($itemList.Count -eq 0) {
+        return @()
+    }
+
+    Ensure-Edge
+    Write-Host "Parallel detail aktif: $ParallelPages"
+
+    $queue = New-Object System.Collections.ArrayList
+    for ($index = 0; $index -lt $itemList.Count; $index++) {
+        [void]$queue.Add([pscustomobject]@{
+            Item = $itemList[$index]
+            ItemIndex = $index + 1
+        })
+    }
+
+    $workerIpcDir = Join-Path $MhtmlRoot (".detail-workers-$PID-{0}" -f (Get-Date -Format 'yyyyMMddHHmmss'))
+    New-Item -ItemType Directory -Force -Path $workerIpcDir | Out-Null
+
+    $workerCount = [Math]::Min($ParallelPages, $itemList.Count)
+    $workers = New-Object System.Collections.ArrayList
+    for ($workerId = 1; $workerId -le $workerCount; $workerId++) {
+        $job = Start-LearningWorkerJob -Id $workerId -IpcDir $workerIpcDir -TaskKind 'Detail'
+        [void]$workers.Add([pscustomobject]@{
+            Id = $workerId
+            Job = $job
+            Busy = $false
+            Task = $null
+            TaskId = 0
+            ItemIndex = 0
+            TotalItems = $itemList.Count
+            TaskPath = (Get-WorkerFilePath -Directory $workerIpcDir -Id $workerId -Kind 'task.json')
+            ResultPath = (Get-WorkerFilePath -Directory $workerIpcDir -Id $workerId -Kind 'result.json')
+            StopPath = (Get-WorkerFilePath -Directory $workerIpcDir -Id $workerId -Kind 'stop')
+        })
+    }
+
+    $nextTaskId = 0
+    try {
+        while ($queue.Count -gt 0 -or @($workers | Where-Object { $_.Busy }).Count -gt 0) {
+            $madeProgress = $false
+
+            foreach ($worker in @($workers)) {
+                Receive-WorkerOutput -Worker $worker
+                $result = Receive-WorkerResult -Worker $worker
+                if ($result) {
+                    if ($result.Success) {
+                        [void]$results.Add($result)
+                        Write-Host "Selesai detail $($result.ItemIndex): $($result.originalUrl) -> $($result.url)"
+                    }
+                    else {
+                        Write-Warning "Detail worker #$($worker.Id) gagal $($result.originalUrl): $($result.Error)"
+                    }
+
+                    $worker.Busy = $false
+                    $worker.Task = $null
+                    $worker.TaskId = 0
+                    $worker.ItemIndex = 0
+                    $madeProgress = $true
+                }
+                elseif ($worker.Busy -and $worker.Job.State -ne 'Running') {
+                    throw "Detail worker #$($worker.Id) berhenti sebelum mengembalikan hasil"
+                }
+                elseif (-not $worker.Busy -and $worker.Job.State -ne 'Running') {
+                    Clear-WorkerPendingFiles -Worker $worker
+                    Remove-Job -Job $worker.Job -Force -ErrorAction SilentlyContinue
+                    $worker.Job = Start-LearningWorkerJob -Id $worker.Id -IpcDir $workerIpcDir -TaskKind 'Detail'
+                    $madeProgress = $true
+                }
+            }
+
+            foreach ($worker in @($workers | Where-Object { -not $_.Busy })) {
+                if ($queue.Count -eq 0) {
+                    break
+                }
+
+                $queued = $queue[0]
+                $queue.RemoveAt(0)
+                $nextTaskId++
+                Send-DetailTaskToWorker -Worker $worker -Item $queued.Item -ItemIndex ([int]$queued.ItemIndex) -TaskId $nextTaskId
+                $madeProgress = $true
+            }
+
+            if (-not $madeProgress) {
+                Start-Sleep -Milliseconds 250
+            }
+        }
+    }
+    finally {
+        Stop-LearningWorkers -Workers $workers -IpcDir $workerIpcDir
+    }
+
+    $seenFinalUrls = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $deduped = New-Object System.Collections.ArrayList
+    foreach ($result in @($results | Sort-Object ItemIndex)) {
+        $key = Get-CanonicalUrlKey -PageUrl ([string]$result.url)
+        if ($seenFinalUrls.Contains($key)) {
+            continue
+        }
+        [void]$seenFinalUrls.Add($key)
+
+        [void]$deduped.Add([pscustomobject]@{
+            title = [string]$result.title
+            url = [string]$result.url
+            originalUrl = [string]$result.originalUrl
+            html = [string]$result.html
+            publishedAt = [string]$result.publishedAt
+            publishedTimestamp = [double]$result.publishedTimestamp
+            children = @($result.children)
+        })
+    }
+
+    return @($deduped | Sort-Object @{ Expression = { [double]$_.publishedTimestamp }; Descending = $true }, @{ Expression = { [string]$_.title }; Ascending = $true })
 }
 
 function New-LearningPageTasks {
