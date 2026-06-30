@@ -395,6 +395,9 @@ function Get-LearningSnapshotExpression {
   const loadingCount = loadingSelectors
     .flatMap(selector => Array.from(document.querySelectorAll(selector)))
     .filter(isVisible).length;
+  const toastErrors = Array.from(document.querySelectorAll('hot-toast-container hot-toast, hot-toast'))
+    .map((toast) => normalize(toast.textContent || ''))
+    .filter((text) => /\berror\b/i.test(text));
 
   const pagination = document.querySelector('pagination') || document.querySelector('[class*="pagination" i]');
   const pageNumbers = [1];
@@ -452,6 +455,8 @@ function Get-LearningSnapshotExpression {
     hasLearningList: !!learningList,
     itemCount: items.length,
     items,
+    toastErrorCount: toastErrors.length,
+    toastErrors,
     loadingCount,
     isLoading: document.readyState !== 'complete' || loadingCount > 0,
     htmlLength
@@ -717,6 +722,11 @@ function Wait-LearningPageReady {
         $json = Invoke-PageEval -Socket $Socket -Expression (Get-LearningSnapshotExpression)
         $data = $json | ConvertFrom-Json
         $lastData = $data
+
+        if ([int]$data.toastErrorCount -gt 0) {
+            $toastText = (@($data.toastErrors) -join '; ')
+            throw "Toast error: $toastText"
+        }
 
         $hasPageData = $data.itemCount -gt 0
         if (-not $data.isLoading -and $hasPageData) {
