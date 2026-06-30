@@ -819,6 +819,23 @@ function ConvertTo-SafeText {
     return (([string]$Value) -replace '\s+', ' ').Trim()
 }
 
+function ConvertTo-LearningTargetTotal {
+    param(
+        [string]$TargetKey,
+        [int]$TotalResults
+    )
+
+    if ($TotalResults -le 0) {
+        return 0
+    }
+
+    if ([string]$TargetKey -ne 'LearnUE') {
+        return $TotalResults
+    }
+
+    return [Math]::Max(0, $TotalResults - 1)
+}
+
 function New-LearningPageSession {
     $target = Open-DevToolsUrl -OpenUrl 'about:blank'
     $socket = [System.Net.WebSockets.ClientWebSocket]::new()
@@ -1984,7 +2001,7 @@ function Invoke-LearningTargetScan {
                 $totalPages = [int]$result.TotalPages
             }
             if ([int]$result.TotalResults -gt 0) {
-                $totalResults = [int]$result.TotalResults
+                $totalResults = ConvertTo-LearningTargetTotal -TargetKey ([string]$Target.Key) -TotalResults ([int]$result.TotalResults)
             }
         }
 
@@ -2021,7 +2038,7 @@ if ($BuildLearn) {
         }
 
         $target | Add-Member -NotePropertyName TotalPages -NotePropertyValue $totalPages -Force
-        $target | Add-Member -NotePropertyName TotalResults -NotePropertyValue ([int]$rootData.TotalResults) -Force
+        $target | Add-Member -NotePropertyName TotalResults -NotePropertyValue (ConvertTo-LearningTargetTotal -TargetKey ([string]$target.Key) -TotalResults ([int]$rootData.TotalResults)) -Force
         Write-Host "Total page $($target.Key): $totalPages"
         Write-Host "Total result $($target.Key): $($target.TotalResults)"
     }
