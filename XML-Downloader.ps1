@@ -6,6 +6,9 @@ param(
     [int]$MaxLoadAttempts = 100000,
     [int]$ParallelPages = 5,
     [int]$MaxPages = 0,
+    [switch]$Doc,
+    [switch]$Learn,
+    [string]$Custom = '',
     [switch]$DryRun,
     [switch]$NoPause,
     [switch]$WorkerMode,
@@ -33,7 +36,7 @@ $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
 $script:StartedEdgeProfileDirs = New-Object System.Collections.ArrayList
 
-$Targets = @(
+$LearningTargets = @(
     [pscustomobject]@{
         Key = 'LearnUE'
         Title = 'Unreal Engine Learning'
@@ -47,6 +50,55 @@ $Targets = @(
         OutputPath = (Join-Path $MhtmlRoot 'LearnMH.xml')
     }
 )
+
+$DocumentationTargets = @(
+    [pscustomobject]@{
+        Key = 'UnrealEngine'
+        Title = 'Unreal Engine Documentation'
+        RootUrl = 'https://dev.epicgames.com/documentation/unreal-engine'
+        OutputPath = (Join-Path $MhtmlRoot 'UnrealEngine.xml')
+    },
+    [pscustomobject]@{
+        Key = 'MetaHuman'
+        Title = 'MetaHuman Documentation'
+        RootUrl = 'https://dev.epicgames.com/documentation/metahuman'
+        OutputPath = (Join-Path $MhtmlRoot 'MetaHuman.xml')
+    },
+    [pscustomobject]@{
+        Key = 'Fab'
+        Title = 'Fab Documentation'
+        RootUrl = 'https://dev.epicgames.com/documentation/fab'
+        OutputPath = (Join-Path $MhtmlRoot 'Fab.xml')
+    },
+    [pscustomobject]@{
+        Key = 'Fortnite'
+        Title = 'Fortnite Documentation'
+        RootUrl = 'https://dev.epicgames.com/documentation/fortnite'
+        OutputPath = (Join-Path $MhtmlRoot 'Fortnite.xml')
+    }
+)
+
+$BuildCustom = -not [string]::IsNullOrWhiteSpace($Custom)
+$BuildAll = -not $Doc -and -not $Learn -and -not $BuildCustom
+$BuildDoc = $BuildAll -or $Doc
+$BuildLearn = $BuildAll -or $Learn
+
+if ($BuildCustom) {
+    $customKey = $Custom.Trim()
+    $allTargets = @($LearningTargets) + @($DocumentationTargets)
+    $matchedTargets = @($allTargets | Where-Object { [string]$_.Key -ieq $customKey })
+
+    if ($matchedTargets.Count -ne 1) {
+        $availableKeys = @($allTargets | ForEach-Object { [string]$_.Key }) -join ', '
+        throw "Custom Key tidak ditemukan: '$Custom'. Pilihan: $availableKeys"
+    }
+
+    $selectedTarget = $matchedTargets[0]
+    $LearningTargets = @($LearningTargets | Where-Object { [string]$_.Key -eq [string]$selectedTarget.Key })
+    $DocumentationTargets = @($DocumentationTargets | Where-Object { [string]$_.Key -eq [string]$selectedTarget.Key })
+    $BuildLearn = $LearningTargets.Count -gt 0
+    $BuildDoc = $DocumentationTargets.Count -gt 0
+}
 
 if ($WorkerMode) {
     if ($WorkerBrowserPort -le 0) {
@@ -401,6 +453,139 @@ function Get-LearningSnapshotExpression {
 '@
 }
 
+function Get-DocumentationSnapshotExpression {
+    return @'
+(() => {
+  const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const toUrl = (value) => {
+    if (!value) return '';
+    try {
+      const url = new URL(value, document.baseURI);
+      if (!/^https?:$/i.test(url.protocol)) return '';
+      return url.href;
+    } catch (_) {
+      return '';
+    }
+  };
+  const directChild = (el, selector) => Array.from(el?.children || []).find((child) => child.matches(selector)) || null;
+  const isVisible = (el) => {
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const isExpandButton = (button) => {
+    const label = normalize(button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '');
+    return /^expand\b/i.test(label) || /\bexpand\b/i.test(label);
+  };
+  const isCollapseButton = (button) => {
+    const label = normalize(button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '');
+    return /^collapse\b/i.test(label) || /\bcollapse\b/i.test(label);
+  };
+  const cleanUrl = (href) => {
+    const url = toUrl(href);
+    if (!url) return '';
+    try {
+      const parsed = new URL(url);
+      parsed.hash = '';
+      return parsed.href;
+    } catch (_) {
+      return url;
+    }
+  };
+  const readItem = (li) => {
+    const row = directChild(li, '.contents-table-el') || li.querySelector(':scope > .contents-table-el, :scope > div');
+    const anchor = row?.querySelector('a[href]') || li.querySelector(':scope > a[href]');
+    const nested = directChild(li, 'ul') || li.querySelector(':scope > ul');
+    const title = normalize(anchor?.textContent || row?.textContent || '');
+    const url = cleanUrl(anchor?.getAttribute('href') || '');
+    const children = nested ? readList(nested) : [];
+    if (!title && !url && children.length === 0) return null;
+    return { title: title || url, url, children };
+  };
+  const readList = (ul) => Array.from(ul?.children || [])
+    .filter((child) => child.matches('li'))
+    .map(readItem)
+    .filter(Boolean);
+
+  const toc = document.querySelector('table-of-contents');
+  const contentsTable = toc?.querySelector('ul.contents-table') || null;
+  const buttons = toc ? Array.from(toc.querySelectorAll('button.btn-expander, button[aria-label]')) : [];
+  const loadingSelectors = [
+    'spinner',
+    '.spinner',
+    '[aria-busy="true"]',
+    '[class*="loading" i]',
+    '[class*="skeleton" i]',
+    '[class*="progress" i]',
+    '[class*="shimmer" i]'
+  ];
+  const loadingCount = loadingSelectors
+    .flatMap(selector => Array.from(document.querySelectorAll(selector)))
+    .filter(isVisible).length;
+
+  const h1 = document.querySelector('h1');
+  const rootTitle = normalize(h1?.textContent || document.title || location.href);
+  const items = contentsTable ? readList(contentsTable) : [];
+  const expandButtonCount = buttons.filter(isExpandButton).length;
+  const collapseButtonCount = buttons.filter(isCollapseButton).length;
+
+  return JSON.stringify({
+    href: location.href,
+    readyState: document.readyState,
+    title: document.title || '',
+    h1: rootTitle,
+    hasTableOfContents: !!toc,
+    hasContentsTable: !!contentsTable,
+    itemCount: items.length,
+    expandButtonCount,
+    collapseButtonCount,
+    loadingCount,
+    isLoading: document.readyState !== 'complete' || loadingCount > 0,
+    items
+  });
+})()
+'@
+}
+
+function Get-DocumentationExpandExpression {
+    param([int]$MaxClicks = 500)
+
+    return @"
+(() => {
+  const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const isExpandButton = (button) => {
+    const label = normalize(button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '');
+    return /^expand\b/i.test(label) || /\bexpand\b/i.test(label);
+  };
+  const toc = document.querySelector('table-of-contents');
+  if (!toc) {
+    return JSON.stringify({ clicked: 0, expandButtonCount: 0, hasTableOfContents: false, hasContentsTable: false });
+  }
+
+  const buttons = Array.from(toc.querySelectorAll('button.btn-expander, button[aria-label]')).filter(isExpandButton);
+  let clicked = 0;
+  for (const button of buttons.slice(0, $MaxClicks)) {
+    try {
+      button.scrollIntoView({ block: 'center', inline: 'nearest' });
+      button.click();
+      clicked++;
+    } catch (_) {
+    }
+  }
+
+  const remaining = Array.from(toc.querySelectorAll('button.btn-expander, button[aria-label]')).filter(isExpandButton).length;
+  const contentsTable = toc.querySelector('ul.contents-table');
+  return JSON.stringify({
+    clicked,
+    expandButtonCount: Math.max(remaining - clicked, 0),
+    hasTableOfContents: true,
+    hasContentsTable: !!contentsTable
+  });
+})()
+"@
+}
+
 function Invoke-PageEval {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
@@ -600,6 +785,104 @@ function Get-LearningPageData {
     try {
         $session = New-LearningPageSession
         return Get-LearningPageDataInSession -Socket $session.Socket -PageUrl $PageUrl
+    }
+    finally {
+        Close-LearningPageSession -Session $session
+    }
+}
+
+function Wait-DocumentationPageReady {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$PageUrl,
+        [int]$Attempt
+    )
+
+    $deadline = (Get-Date).AddSeconds($PageLoadTimeoutSeconds)
+    $stableSince = $null
+    $lastData = $null
+
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $BrowserPollSeconds
+
+        $expandJson = Invoke-PageEval -Socket $Socket -Expression (Get-DocumentationExpandExpression)
+        $expandData = $expandJson | ConvertFrom-Json
+        if ($expandData.clicked -gt 0) {
+            $stableSince = $null
+            Write-Host "  Expand TOC: klik $($expandData.clicked) tombol"
+            continue
+        }
+
+        $json = Invoke-PageEval -Socket $Socket -Expression (Get-DocumentationSnapshotExpression)
+        $data = $json | ConvertFrom-Json
+        $lastData = $data
+
+        $hasPageData = $data.hasTableOfContents -and $data.hasContentsTable -and $data.itemCount -gt 0
+        if (-not $data.isLoading -and $hasPageData -and [int]$data.expandButtonCount -eq 0) {
+            if (-not $stableSince) {
+                $stableSince = Get-Date
+            }
+
+            if (((Get-Date) - $stableSince).TotalSeconds -ge $PageIdleSeconds) {
+                return $data
+            }
+        }
+        else {
+            $stableSince = $null
+        }
+    }
+
+    $title = if ($lastData) { [string]$lastData.title } else { '' }
+    $h1 = if ($lastData) { [string]$lastData.h1 } else { '' }
+    $count = if ($lastData) { [int]$lastData.itemCount } else { 0 }
+    $expandCount = if ($lastData) { [int]$lastData.expandButtonCount } else { 0 }
+    throw "Timeout load documentation attempt #${Attempt}: $PageUrl title='$title' h1='$h1' item_count=$count expand_count=$expandCount"
+}
+
+function Get-DocumentationPageDataInSession {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$PageUrl
+    )
+
+    Write-Host "Buka Edge documentation: $PageUrl"
+    for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
+        Reset-NetworkState
+        if ($attempt -gt 1) {
+            Write-Warning "Navigasi ulang ke URL documentation error: $PageUrl"
+        }
+
+        $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl }
+        Update-NetworkStateFromNavigateResult -Response $navigateResponse
+
+        try {
+            $data = Wait-DocumentationPageReady -Socket $Socket -PageUrl $PageUrl -Attempt $attempt
+            Assert-PageLoadOk -Data $data
+            return [pscustomobject]@{
+                PageUrl = $PageUrl
+                FinalUrl = [string]$data.href
+                Title = [string]$data.h1
+                Items = @($data.items)
+            }
+        }
+        catch {
+            if ($attempt -ge $MaxLoadAttempts) {
+                throw
+            }
+            Write-Warning $_.Exception.Message
+        }
+    }
+
+    throw "Gagal membaca halaman documentation: $PageUrl"
+}
+
+function Get-DocumentationPageData {
+    param([string]$PageUrl)
+
+    $session = $null
+    try {
+        $session = New-LearningPageSession
+        return Get-DocumentationPageDataInSession -Socket $session.Socket -PageUrl $PageUrl
     }
     finally {
         Close-LearningPageSession -Session $session
@@ -934,6 +1217,87 @@ function ConvertTo-LearningXml {
     return [string[]]$lines.ToArray()
 }
 
+function Add-DocumentationXmlItems {
+    param(
+        [System.Collections.ArrayList]$Lines,
+        [object[]]$Items,
+        [int]$Depth
+    )
+
+    $indent = "`t" * $Depth
+    foreach ($item in @($Items)) {
+        if (-not $item) {
+            continue
+        }
+
+        $title = ConvertTo-SafeText ([string]$item.title)
+        $href = [string]$item.url
+        $children = @($item.children)
+        if ([string]::IsNullOrWhiteSpace($title)) {
+            $title = $href
+        }
+        if ([string]::IsNullOrWhiteSpace($title) -and $children.Count -eq 0) {
+            continue
+        }
+
+        $label = ConvertTo-XmlAttributeValue $title
+        $safeHref = ConvertTo-XmlAttributeValue $href
+        $linkClass = if ($children.Count -gt 0) { 'contents-table-link is-parent' } else { 'contents-table-link' }
+
+        [void]$Lines.Add("$indent<li class=""contents-table-item"">")
+        [void]$Lines.Add("$indent`t<div class=""contents-table-el""><a class=""$linkClass"" href=""$safeHref"">$label</a></div>")
+
+        if ($children.Count -gt 0) {
+            [void]$Lines.Add("$indent`t<ul class=""contents-table-list"">")
+            Add-DocumentationXmlItems -Lines $Lines -Items $children -Depth ($Depth + 2)
+            [void]$Lines.Add("$indent`t</ul>")
+        }
+
+        [void]$Lines.Add("$indent</li>")
+    }
+}
+
+function ConvertTo-DocumentationXml {
+    param(
+        $Target,
+        $Data
+    )
+
+    $title = ConvertTo-SafeText ([string]$Data.Title)
+    if ([string]::IsNullOrWhiteSpace($title)) {
+        $title = [string]$Target.Title
+    }
+
+    $rootUrl = [string]$Data.FinalUrl
+    if ([string]::IsNullOrWhiteSpace($rootUrl)) {
+        $rootUrl = [string]$Target.RootUrl
+    }
+
+    $lines = New-Object System.Collections.ArrayList
+    $items = @($Data.Items)
+    if ($items.Count -eq 1) {
+        $firstItem = $items[0]
+        $firstTitle = ConvertTo-SafeText ([string]$firstItem.title)
+        $firstUrl = [string]$firstItem.url
+        $firstChildren = @($firstItem.children)
+        $isRootWrapper = $firstChildren.Count -gt 0 -and (
+            [string]::IsNullOrWhiteSpace($firstUrl) -or
+            $firstUrl.TrimEnd('/') -ieq $rootUrl.TrimEnd('/') -or
+            $firstTitle -ieq $title
+        )
+
+        if ($isRootWrapper) {
+            $items = $firstChildren
+        }
+    }
+
+    [void]$lines.Add(('<div class="contents-table-el is-active is-root-entry"><a class="contents-table-link is-parent" href="{0}">{1}</a></div>' -f (ConvertTo-XmlAttributeValue $rootUrl), (ConvertTo-XmlAttributeValue $title)))
+    [void]$lines.Add('<ul class="contents-table-list">')
+    Add-DocumentationXmlItems -Lines $lines -Items $items -Depth 1
+    [void]$lines.Add('</ul>')
+    return [string[]]$lines.ToArray()
+}
+
 function Invoke-ParallelPageReads {
     param([object[]]$Tasks)
 
@@ -1034,31 +1398,40 @@ function Invoke-ParallelPageReads {
 }
 
 $allPageTasks = New-Object System.Collections.ArrayList
-foreach ($target in $Targets) {
-    Write-Host ""
-    Write-Host "Baca root: $($target.RootUrl)"
-    $rootData = Get-LearningPageData -PageUrl $target.RootUrl
-    $totalPages = [Math]::Max(1, [int]$rootData.TotalPages)
-    if ($MaxPages -gt 0) {
-        $totalPages = [Math]::Min($totalPages, $MaxPages)
-    }
+if ($BuildLearn) {
+    foreach ($target in $LearningTargets) {
+        Write-Host ""
+        Write-Host "Baca root: $($target.RootUrl)"
+        $rootData = Get-LearningPageData -PageUrl $target.RootUrl
+        $totalPages = [Math]::Max(1, [int]$rootData.TotalPages)
+        if ($MaxPages -gt 0) {
+            $totalPages = [Math]::Min($totalPages, $MaxPages)
+        }
 
-    $target | Add-Member -NotePropertyName TotalPages -NotePropertyValue $totalPages -Force
-    Write-Host "Total page $($target.Key): $totalPages"
+        $target | Add-Member -NotePropertyName TotalPages -NotePropertyValue $totalPages -Force
+        Write-Host "Total page $($target.Key): $totalPages"
 
-    for ($page = 1; $page -le $totalPages; $page++) {
-        [void]$allPageTasks.Add([pscustomobject]@{
-            TargetKey = [string]$target.Key
-            Page = $page
-            Url = (ConvertTo-PageUrl -RootUrl $target.RootUrl -Page $page)
-        })
+        for ($page = 1; $page -le $totalPages; $page++) {
+            [void]$allPageTasks.Add([pscustomobject]@{
+                TargetKey = [string]$target.Key
+                Page = $page
+                Url = (ConvertTo-PageUrl -RootUrl $target.RootUrl -Page $page)
+            })
+        }
     }
 }
 
 if ($DryRun) {
     Write-Host "DryRun aktif: tidak menulis XML."
-    foreach ($target in $Targets) {
-        Write-Host "$($target.Key): $($target.TotalPages) page -> $($target.OutputPath)"
+    if ($BuildLearn) {
+        foreach ($target in $LearningTargets) {
+            Write-Host "$($target.Key): $($target.TotalPages) page -> $($target.OutputPath)"
+        }
+    }
+    if ($BuildDoc) {
+        foreach ($target in $DocumentationTargets) {
+            Write-Host "$($target.Key): documentation TOC -> $($target.OutputPath)"
+        }
     }
     Stop-StartedEdge
     if (-not $NoPause) {
@@ -1067,23 +1440,45 @@ if ($DryRun) {
     return
 }
 
-$pageResults = @(Invoke-ParallelPageReads -Tasks @($allPageTasks))
-foreach ($target in $Targets) {
-    $targetResults = @($pageResults | Where-Object { [string]$_.TargetKey -eq [string]$target.Key } | Sort-Object Page)
-    $items = New-Object System.Collections.ArrayList
-    foreach ($result in $targetResults) {
-        foreach ($item in @($result.Items)) {
-            [void]$items.Add($item)
+$pageResults = @()
+if ($BuildLearn -and $allPageTasks.Count -gt 0) {
+    $pageResults = @(Invoke-ParallelPageReads -Tasks @($allPageTasks))
+    foreach ($target in $LearningTargets) {
+        $targetResults = @($pageResults | Where-Object { [string]$_.TargetKey -eq [string]$target.Key } | Sort-Object Page)
+        $items = New-Object System.Collections.ArrayList
+        foreach ($result in $targetResults) {
+            foreach ($item in @($result.Items)) {
+                [void]$items.Add($item)
+            }
         }
-    }
 
-    $xmlLines = ConvertTo-LearningXml -Target $target -PageResults $targetResults
-    Set-Content -LiteralPath $target.OutputPath -Value $xmlLines -Encoding UTF8
-    Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($($targetResults.Count) page, $(@($items).Count) link mentah)"
+        $xmlLines = ConvertTo-LearningXml -Target $target -PageResults $targetResults
+        Set-Content -LiteralPath $target.OutputPath -Value $xmlLines -Encoding UTF8
+        Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($($targetResults.Count) page, $(@($items).Count) link mentah)"
+    }
+}
+
+if ($BuildDoc) {
+    foreach ($target in $DocumentationTargets) {
+        Write-Host ""
+        Write-Host "Baca documentation TOC: $($target.RootUrl)"
+        $documentationData = Get-DocumentationPageData -PageUrl $target.RootUrl
+        $xmlLines = ConvertTo-DocumentationXml -Target $target -Data $documentationData
+        Set-Content -LiteralPath $target.OutputPath -Value $xmlLines -Encoding UTF8
+        Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($(@($documentationData.Items).Count) root link, final: $($documentationData.FinalUrl))"
+    }
 }
 
 Write-Host ""
-Write-Host "Selesai generate XML learning."
+if ($BuildDoc -and $BuildLearn) {
+    Write-Host "Selesai generate XML learning dan documentation."
+}
+elseif ($BuildDoc) {
+    Write-Host "Selesai generate XML documentation."
+}
+else {
+    Write-Host "Selesai generate XML learning."
+}
 Stop-StartedEdge
 if (-not $NoPause) {
     pause
