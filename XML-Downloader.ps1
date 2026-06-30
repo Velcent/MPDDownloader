@@ -395,10 +395,10 @@ function Handle-CdpEvent {
         $shouldBlock = -not $LoadImages -and (
             $resourceType -eq 'Image' -or
             $resourceType -eq 'Media' -or
-            (($resourceType -eq 'Document' -or $resourceType -eq 'Other') -and $isEmbedUrl) -or
+            ($resourceType -eq 'Other' -and $isEmbedUrl) -or
             $requestUrl -match '(?i)/community/api/(learning|documentation|user_profiles)/image/' -or
             $requestUrl -match '(?i)[?&]resizing_type=' -or
-            $isEmbedUrl
+            ($resourceType -ne 'Document' -and $isEmbedUrl)
         )
 
         $method = if ($shouldBlock) { 'Fetch.failRequest' } else { 'Fetch.continueRequest' }
@@ -920,16 +920,26 @@ function New-LearningPageSession {
     [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
     if (-not $LoadImages) {
+        [void](Invoke-CdpCommand -Socket $socket -Method 'Page.addScriptToEvaluateOnNewDocument' -Params @{
+            source = @'
+(() => {
+  const removeEmbeds = () => {
+    document.querySelectorAll('iframe, embed, object, video, audio').forEach((el) => {
+      try { el.remove(); } catch (_) {}
+    });
+  };
+  removeEmbeds();
+  new MutationObserver(removeEmbeds).observe(document.documentElement || document, { childList: true, subtree: true });
+})();
+'@
+        })
+    }
+    if (-not $LoadImages) {
         [void](Invoke-CdpCommand -Socket $socket -Method 'Fetch.enable' -Params @{
             patterns = @(
                 @{
                     urlPattern = '*'
                     resourceType = 'Image'
-                    requestStage = 'Request'
-                },
-                @{
-                    urlPattern = '*'
-                    resourceType = 'Document'
                     requestStage = 'Request'
                 },
                 @{
