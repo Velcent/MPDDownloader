@@ -448,13 +448,19 @@ function Get-MhtmlSnapshotExpression {
 function Invoke-PageEval {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
-        [string]$Expression
+        [string]$Expression,
+        [switch]$AwaitPromise
     )
 
-    $response = Invoke-CdpCommand -Socket $Socket -Method 'Runtime.evaluate' -Params @{
+    $params = @{
         expression = $Expression
         returnByValue = $true
     }
+    if ($AwaitPromise.IsPresent) {
+        $params.awaitPromise = $true
+    }
+
+    $response = Invoke-CdpCommand -Socket $Socket -Method 'Runtime.evaluate' -Params $params
 
     if ($response.result.exceptionDetails) {
         throw "Runtime evaluate gagal: $($response.result.exceptionDetails.text)"
@@ -498,6 +504,420 @@ function Wait-MhtmlPageReady {
     $title = if ($lastData) { [string]$lastData.title } else { '' }
     $h1 = if ($lastData) { [string]$lastData.h1 } else { '' }
     throw "Timeout load halaman attempt #${Attempt}: $PageUrl title='$title' h1='$h1'"
+}
+
+function Get-MhtmlSwitchDiscoveryExpression {
+    return @'
+(async () => {
+  const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  const mapIcon = (el) => {
+    const cls = (el?.className || '').toString().toLowerCase();
+    if (cls.includes('icon-windows')) return 'Windows';
+    if (cls.includes('icon-linux')) return 'Linux';
+    if (cls.includes('icon-apple') || cls.includes('icon-mac') || cls.includes('icon-macos')) return 'MacOS';
+    if (cls.includes('icon-blueprint')) return 'Blueprint';
+    if (cls.includes('icon-cpp') || cls.includes('icon-cplusplus')) return 'C++';
+    return '';
+  };
+  const unique = (items) => {
+    const seen = new Set();
+    return items.map(normalize).filter(Boolean).filter(item => {
+      const key = item.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+  const canonicalOption = (value) => {
+    const text = normalize(value);
+    const key = text.toLowerCase().replace(/[\s_+-]+/g, '');
+    if (key === 'windows') return 'Windows';
+    if (key === 'linux') return 'Linux';
+    if (key === 'mac' || key === 'macos' || key === 'apple') return 'MacOS';
+    if (key === 'blueprint') return 'Blueprint';
+    if (key === 'cpp' || key === 'cplusplus' || text === 'C++') return 'C++';
+    return text;
+  };
+  const readDropdownOptions = async (control) => {
+    const openers = Array.from(control.querySelectorAll('.ng-select-container, .ng-arrow-wrapper, input[role="combobox"], ng-select, .ng-select, [role="combobox"], button'));
+    if (openers.length === 0) openers.push(control);
+    for (const opener of openers) {
+      try {
+        opener.focus?.();
+        opener.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+        opener.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        opener.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+        opener.click();
+        opener.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', altKey: true, bubbles: true, cancelable: true }));
+      } catch {}
+      await delay(150);
+      if (document.querySelector('.ng-dropdown-panel .ng-option')) break;
+    }
+    let optionNodes = [];
+    for (let attempt = 0; attempt < 10; attempt++) {
+      optionNodes = Array.from(document.querySelectorAll('.ng-dropdown-panel .ng-option'));
+      if (optionNodes.length > 0) break;
+      await delay(150);
+    }
+    const options = optionNodes
+      .filter(option => !option.classList.contains('ng-option-disabled'))
+      .map(option => canonicalOption(option.innerText || option.textContent || option.getAttribute('aria-label') || option.getAttribute('title') || mapIcon(option.querySelector('.block-switch-option-icon, [class*="icon-"]')) || ''));
+    try {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    } catch {}
+    return unique(options.filter(option => option && !/loading|no items|no results/i.test(option)));
+  };
+  const fallbackOptionsFor = (root) => {
+    const roots = root ? [root] : Array.from(document.querySelectorAll('block-switch-view'));
+    const labels = [];
+    for (const item of roots) {
+      for (const icon of Array.from(item.querySelectorAll('.block-switch-option-icon, [class*="icon-"]'))) {
+        const label = mapIcon(icon);
+        if (label) labels.push(label);
+      }
+    }
+    return unique(labels);
+  };
+  const controls = Array.from(document.querySelectorAll('block-switch-control'));
+  const groups = [];
+  for (let index = 0; index < controls.length; index++) {
+    let options = await readDropdownOptions(controls[index]);
+    if (options.length === 0) {
+      options = fallbackOptionsFor(controls[index]);
+    }
+    if (options.length > 0) {
+      groups.push({ index, options });
+    }
+  }
+  if (groups.length === 0) {
+    const fallback = fallbackOptionsFor(null);
+    if (fallback.length > 0) {
+      groups.push({ index: 0, options: fallback, fallbackOnly: true });
+    }
+  }
+  return JSON.stringify({ hasSwitch: controls.length > 0 || groups.length > 0, groups });
+})()
+'@
+}
+
+function Get-MhtmlSwitchSelectExpression {
+    param([string[]]$Options)
+
+    $json = ConvertTo-Json @($Options) -Compress
+    return @"
+(async () => {
+  const requested = $json;
+  const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  const labelOf = (el) => normalize(el?.innerText || el?.textContent || el?.getAttribute('aria-label') || el?.getAttribute('title') || mapIcon(el?.querySelector?.('.block-switch-option-icon, [class*="icon-"]')) || mapIcon(el) || '');
+  const mapIcon = (el) => {
+    const cls = (el?.className || '').toString().toLowerCase();
+    if (cls.includes('icon-windows')) return 'Windows';
+    if (cls.includes('icon-linux')) return 'Linux';
+    if (cls.includes('icon-apple') || cls.includes('icon-mac') || cls.includes('icon-macos')) return 'MacOS';
+    if (cls.includes('icon-blueprint')) return 'Blueprint';
+    if (cls.includes('icon-cpp') || cls.includes('icon-cplusplus')) return 'C++';
+    return '';
+  };
+  const canonicalOption = (value) => {
+    const text = normalize(value);
+    const key = text.toLowerCase().replace(/[\s_+-]+/g, '');
+    if (key === 'windows') return 'Windows';
+    if (key === 'linux') return 'Linux';
+    if (key === 'mac' || key === 'macos' || key === 'apple') return 'MacOS';
+    if (key === 'blueprint') return 'Blueprint';
+    if (key === 'cpp' || key === 'cplusplus' || text === 'C++') return 'C++';
+    return text;
+  };
+  const clickDropdownOption = async (control, label) => {
+    const openers = Array.from(control?.querySelectorAll?.('.ng-select-container, .ng-arrow-wrapper, input[role="combobox"], ng-select, .ng-select, [role="combobox"], button') || []);
+    if (openers.length === 0 && control) openers.push(control);
+    if (openers.length === 0) return false;
+    for (const opener of openers) {
+      try {
+        opener.focus?.();
+        opener.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+        opener.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        opener.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+        opener.click();
+        opener.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', altKey: true, bubbles: true, cancelable: true }));
+      } catch {}
+      await delay(150);
+      if (document.querySelector('.ng-dropdown-panel .ng-option')) break;
+    }
+    const wanted = canonicalOption(label).toLowerCase();
+    let options = [];
+    for (let attempt = 0; attempt < 10; attempt++) {
+      options = Array.from(document.querySelectorAll('.ng-dropdown-panel .ng-option'))
+        .filter(option => !option.classList.contains('ng-option-disabled'));
+      if (options.length > 0) break;
+      await delay(150);
+    }
+    let match = options.find(option => canonicalOption(labelOf(option)).toLowerCase() === wanted) ||
+      options.find(option => canonicalOption(labelOf(option)).toLowerCase().includes(wanted));
+    if (match) {
+      match.scrollIntoView({ block: 'center', inline: 'nearest' });
+      try {
+        match.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        match.click();
+      } catch {}
+      return true;
+    }
+    try {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    } catch {}
+    return false;
+  };
+  const clickFallbackOption = async (label) => {
+    const wanted = canonicalOption(label).toLowerCase();
+    const candidates = Array.from(document.querySelectorAll(
+      'block-switch-control button, block-switch-control [role="button"], block-switch-control .block-switch-option-icon, block-switch-view button, block-switch-view [role="button"], block-switch-view .block-switch-option-icon'
+    )).filter(visible);
+    const match = candidates.find(el => {
+      const iconLabel = mapIcon(el);
+      const textLabel = labelOf(el);
+      return canonicalOption(iconLabel).toLowerCase() === wanted || canonicalOption(textLabel).toLowerCase() === wanted || canonicalOption(textLabel).toLowerCase().includes(wanted);
+    });
+    if (!match) return false;
+    const clickable = match.closest('button, [role="button"], .ng-option') || match;
+    try {
+      clickable.scrollIntoView({ block: 'center', inline: 'nearest' });
+      clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+      clickable.click();
+      await delay(250);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const controls = Array.from(document.querySelectorAll('block-switch-control'));
+  const selected = [];
+  for (let index = 0; index < requested.length; index++) {
+    const label = requested[index];
+    let ok = false;
+    if (controls[index]) {
+      ok = await clickDropdownOption(controls[index], label);
+    }
+    if (!ok) {
+      ok = await clickFallbackOption(label);
+    }
+    selected.push({ label, selected: ok });
+    await delay(900);
+  }
+  return JSON.stringify({ selected });
+})()
+"@
+}
+
+function Get-MhtmlSnippetPrepareExpression {
+    return @'
+(async () => {
+  const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  const textOf = (el) => el ? (el.value || el.innerText || el.textContent || '') : '';
+  const isBlueprintSource = (text) => /Begin Object[\s\S]*End Object/.test(text || '');
+  const snippetType = (snippet) => snippet.querySelector('blueprint-render') ? 'blueprint' : 'code';
+  const sourceLooksUseful = (text, type) => {
+    const value = (text || '').trim();
+    if (!value) return false;
+    if (type === 'blueprint') return isBlueprintSource(value);
+    if (/^(copied|copy|copy full snippet)$/i.test(value)) return false;
+    return value.length > 0;
+  };
+  const existingVisibleSource = (snippet, type) => {
+    const nodes = Array.from(snippet.querySelectorAll('textarea, pre code, pre, code, [class*="source" i], [class*="code" i]'));
+    const texts = nodes.map(textOf).filter(text => sourceLooksUseful(text, type));
+    texts.sort((a, b) => b.length - a.length);
+    return texts[0] || '';
+  };
+  const findCopyButton = (snippet) => {
+    const actionRoots = Array.from(snippet.querySelectorAll('.block-code-snippet-actions, [class*="snippet-actions" i]'));
+    const roots = actionRoots.length ? actionRoots : [snippet];
+    const candidates = roots.flatMap(root => Array.from(root.querySelectorAll('button, [role="button"], a')));
+    const scored = candidates.filter(visible).map(button => {
+      const label = normalize([
+        button.innerText,
+        button.textContent,
+        button.getAttribute('aria-label'),
+        button.getAttribute('title'),
+        button.getAttribute('data-tooltip'),
+        button.getAttribute('mattooltip')
+      ].filter(Boolean).join(' '));
+      let score = 0;
+      if (/copy/i.test(label)) score += 4;
+      if (/full/i.test(label)) score += 3;
+      if (/snippet|code/i.test(label)) score += 2;
+      if (/expand/i.test(label)) score -= 10;
+      if ((button.className || '').toString().match(/copy/i)) score += 2;
+      return { button, label, score };
+    }).filter(item => item.score > 0);
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0]?.button || null;
+  };
+  const readClipboardText = async () => {
+    try {
+      if (!navigator.clipboard?.readText) return '';
+      return await navigator.clipboard.readText();
+    } catch {
+      return '';
+    }
+  };
+  const injectTextarea = (snippet, text, type) => {
+    let textarea = snippet.querySelector('textarea.mhtml-full-snippet-source');
+    if (!textarea) {
+      textarea = document.createElement('textarea');
+      textarea.className = 'mhtml-full-snippet-source';
+      snippet.appendChild(textarea);
+    }
+    textarea.removeAttribute('hidden');
+    textarea.setAttribute('aria-hidden', 'true');
+    textarea.setAttribute('readonly', 'readonly');
+    textarea.setAttribute('data-mhtml-hidden', 'true');
+    textarea.setAttribute('data-snippet-type', type);
+    textarea.setAttribute('data-source-length', String((text || '').length));
+    textarea.style.cssText = 'display:block !important; position:absolute !important; left:-100000px !important; top:auto !important; width:1px !important; height:1px !important; opacity:0 !important; pointer-events:none !important;';
+    textarea.value = text || '';
+    textarea.textContent = text || '';
+  };
+  const snippets = Array.from(document.querySelectorAll('block-code-snippet'));
+  const results = [];
+  for (let index = 0; index < snippets.length; index++) {
+    const snippet = snippets[index];
+    const type = snippetType(snippet);
+    const beforeClipboard = await readClipboardText();
+    const button = findCopyButton(snippet);
+    if (button) {
+      try {
+        button.scrollIntoView({ block: 'center', inline: 'nearest' });
+        button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        button.click();
+      } catch {}
+    }
+
+    let source = '';
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await delay(150);
+      const clipboardText = await readClipboardText();
+      if (sourceLooksUseful(clipboardText, type) && clipboardText !== beforeClipboard) {
+        source = clipboardText;
+        break;
+      }
+      const domText = existingVisibleSource(snippet, type);
+      if (sourceLooksUseful(domText, type)) {
+        source = domText;
+        break;
+      }
+      if (sourceLooksUseful(clipboardText, type)) {
+        source = clipboardText;
+      }
+    }
+
+    if (!source) {
+      source = existingVisibleSource(snippet, type);
+    }
+    if (sourceLooksUseful(source, type)) {
+      injectTextarea(snippet, source, type);
+    }
+    results.push({
+      index,
+      type,
+      clicked: !!button,
+      injected: !!snippet.querySelector('textarea.mhtml-full-snippet-source'),
+      sourceLength: (source || '').length,
+      hasBeginObject: /Begin Object/.test(source || ''),
+      hasEndObject: /End Object/.test(source || '')
+    });
+  }
+  return JSON.stringify({ snippetCount: snippets.length, results });
+})()
+'@
+}
+
+function Get-SwitchOptionCombinations {
+    param([object[]]$Groups)
+
+    $combinations = New-Object System.Collections.ArrayList
+    [void]$combinations.Add([pscustomobject]@{ Options = @() })
+
+    foreach ($group in @($Groups)) {
+        $options = @($group.options | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($options.Count -eq 0) {
+            continue
+        }
+
+        $next = New-Object System.Collections.ArrayList
+        foreach ($prefix in @($combinations)) {
+            foreach ($option in $options) {
+                [void]$next.Add([pscustomobject]@{ Options = @($prefix.Options) + @([string]$option) })
+            }
+        }
+        $combinations = $next
+    }
+
+    if ($combinations.Count -eq 0) {
+        [void]$combinations.Add([pscustomobject]@{ Options = @() })
+    }
+
+    return @($combinations)
+}
+
+function Get-MhtmlVariantFilePath {
+    param(
+        [string]$BaseFilePath,
+        [string[]]$Options
+    )
+
+    if (-not $Options -or $Options.Count -eq 0) {
+        return $BaseFilePath
+    }
+
+    $folder = [System.IO.Path]::GetDirectoryName($BaseFilePath)
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($BaseFilePath)
+    $suffix = (($Options | ForEach-Object { " [--$(ConvertTo-SafeSegment -Value ([string]$_) -MaxLength 40)--]" }) -join '')
+    return (Join-Path $folder "$baseName$suffix.mhtml")
+}
+
+function New-MhtmlSaveResult {
+    param(
+        [string]$OriginalUrl,
+        [string]$FinalUrl,
+        [string]$Title,
+        [string]$FilePath,
+        [bool]$Saved,
+        [int]$ChildCount,
+        [string]$ParentUrl,
+        [string]$SourceXml
+    )
+
+    return [pscustomobject]@{
+        OriginalUrl = $OriginalUrl
+        FinalUrl = $FinalUrl
+        Title = $Title
+        FilePath = $FilePath
+        Saved = $Saved
+        ChildCount = $ChildCount
+        ParentUrl = $ParentUrl
+        SourceXml = $SourceXml
+    }
 }
 
 function Assert-PageLoadOk {
@@ -778,6 +1198,7 @@ function Get-DownloadedResumeMap {
     param([string[]]$Paths)
 
     $urlMap = @{}
+    $fileMap = @{}
 
     foreach ($path in @($Paths)) {
         if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
@@ -800,11 +1221,21 @@ function Get-DownloadedResumeMap {
                 catch {
                 }
             }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.file)) {
+                try {
+                    $fileMap[(ConvertTo-LocalPathFromListValue ([string]$row.file)).ToLowerInvariant()] = $true
+                }
+                catch {
+                    $fileMap[([string]$row.file).ToLowerInvariant()] = $true
+                }
+            }
         }
     }
 
     return [pscustomobject]@{
         UrlMap = $urlMap
+        FileMap = $fileMap
         Count = $urlMap.Count
     }
 }
@@ -1074,6 +1505,15 @@ function New-MhtmlPageSession {
     [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
+    try {
+        [void](Invoke-CdpCommand -Socket $socket -Method 'Browser.grantPermissions' -Params @{
+            origin = 'https://dev.epicgames.com'
+            permissions = @('clipboardReadWrite', 'clipboardSanitizedWrite')
+        })
+    }
+    catch {
+        Write-Warning "Grant clipboard permission gagal, lanjut dengan fallback DOM: $($_.Exception.Message)"
+    }
 
     return [pscustomobject]@{
         Socket = $socket
@@ -1106,10 +1546,10 @@ function Save-MhtmlPageInSession {
     )
 
     $pageUrl = [string]$Task.Url
-    $filePath = [System.IO.Path]::GetFullPath([string]$Task.FilePath)
-    $folder = [System.IO.Path]::GetDirectoryName($filePath)
+    $baseFilePath = [System.IO.Path]::GetFullPath([string]$Task.FilePath)
     $saved = $false
     $data = $null
+    $results = New-Object System.Collections.ArrayList
     $pageUrlCandidates = @(Get-PageUrlCandidates -PageUrl $pageUrl)
     $candidateIndex = 0
     $attempt = 0
@@ -1137,17 +1577,71 @@ function Save-MhtmlPageInSession {
             Assert-PageLoadOk -Data $data
             Assert-FinalUrlDoesNotPointToKnownDifferentPage -Task $Task -Data $data
 
-            New-Item -ItemType Directory -Force -Path $folder | Out-Null
-            $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
-            $snapshotData = [string]$snapshot.result.data
-            $snapshotBytes = [System.Text.Encoding]::UTF8.GetByteCount($snapshotData)
-            if ($snapshotBytes -lt $MinimumMhtmlBytes) {
-                throw "MHTML terlalu kecil: $snapshotBytes bytes (< $MinimumMhtmlBytes bytes)"
+            $switchJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSwitchDiscoveryExpression) -AwaitPromise
+            $switchData = $switchJson | ConvertFrom-Json
+            $switchGroups = @()
+            if ($switchData -and $switchData.groups) {
+                $switchGroups = @($switchData.groups)
+            }
+            $switchCombinations = @(Get-SwitchOptionCombinations -Groups $switchGroups)
+            if ($switchCombinations.Count -gt 1 -or ($switchCombinations.Count -eq 1 -and @($switchCombinations[0].Options).Count -gt 0)) {
+                Write-Host "Variasi block-switch-control: $($switchCombinations.Count) kombinasi"
             }
 
-            [System.IO.File]::WriteAllText($filePath, $snapshotData, [System.Text.UTF8Encoding]::new($false))
-            $saved = $true
-            Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath) ($snapshotBytes bytes)"
+            $title = if ($data -and -not [string]::IsNullOrWhiteSpace([string]$data.h1)) { [string]$data.h1 } else { [string]$Task.Title }
+            $finalUrl = if ($data -and -not [string]::IsNullOrWhiteSpace([string]$data.href)) { [string]$data.href } else { $pageUrl }
+
+            foreach ($combination in $switchCombinations) {
+                $options = if ($combination.PSObject.Properties['Options']) {
+                    @($combination.Options | ForEach-Object { [string]$_ })
+                }
+                else {
+                    @($combination | ForEach-Object { [string]$_ })
+                }
+                if ($options.Count -gt 0) {
+                    $selectJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSwitchSelectExpression -Options $options) -AwaitPromise
+                    $selectData = $selectJson | ConvertFrom-Json
+                    $failedSelections = @($selectData.selected | Where-Object { -not $_.selected })
+                    if ($failedSelections.Count -gt 0) {
+                        Write-Warning "Sebagian opsi switch tidak bisa dipilih: $((@($failedSelections | ForEach-Object { $_.label }) -join ', '))"
+                    }
+                }
+
+                $snippetJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSnippetPrepareExpression) -AwaitPromise
+                $snippetData = $snippetJson | ConvertFrom-Json
+                if ($snippetData -and [int]$snippetData.snippetCount -gt 0) {
+                    $injectedCount = @($snippetData.results | Where-Object { $_.injected }).Count
+                    $blueprintMissing = @($snippetData.results | Where-Object { $_.type -eq 'blueprint' -and (-not $_.hasBeginObject -or -not $_.hasEndObject) }).Count
+                    Write-Host "Snippet full source: $injectedCount/$($snippetData.snippetCount) injected"
+                    if ($blueprintMissing -gt 0) {
+                        Write-Warning "Blueprint snippet tanpa Begin Object/End Object setelah copy: $blueprintMissing"
+                    }
+                }
+
+                $filePath = Get-MhtmlVariantFilePath -BaseFilePath $baseFilePath -Options $options
+                $folder = [System.IO.Path]::GetDirectoryName($filePath)
+                New-Item -ItemType Directory -Force -Path $folder | Out-Null
+
+                $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
+                $snapshotData = [string]$snapshot.result.data
+                $snapshotBytes = [System.Text.Encoding]::UTF8.GetByteCount($snapshotData)
+                if ($snapshotBytes -lt $MinimumMhtmlBytes) {
+                    throw "MHTML terlalu kecil: $snapshotBytes bytes (< $MinimumMhtmlBytes bytes)"
+                }
+
+                [System.IO.File]::WriteAllText($filePath, $snapshotData, [System.Text.UTF8Encoding]::new($false))
+                $saved = $true
+                [void]$results.Add((New-MhtmlSaveResult `
+                    -OriginalUrl $pageUrl `
+                    -FinalUrl $finalUrl `
+                    -Title $title `
+                    -FilePath $filePath `
+                    -Saved $true `
+                    -ChildCount ([int]$Task.ChildCount) `
+                    -ParentUrl ([string]$Task.ParentUrl) `
+                    -SourceXml ([string]$Task.SourceXml)))
+                Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath) ($snapshotBytes bytes)"
+            }
             break
         }
         catch {
@@ -1175,19 +1669,7 @@ function Save-MhtmlPageInSession {
         throw "Gagal menyimpan MHTML: $pageUrl - $lastErrorMessage"
     }
 
-    $title = if ($data -and -not [string]::IsNullOrWhiteSpace([string]$data.h1)) { [string]$data.h1 } else { [string]$Task.Title }
-    $finalUrl = if ($data -and -not [string]::IsNullOrWhiteSpace([string]$data.href)) { [string]$data.href } else { $pageUrl }
-
-    return [pscustomobject]@{
-        OriginalUrl = $pageUrl
-        FinalUrl = $finalUrl
-        Title = $title
-        FilePath = $filePath
-        Saved = $saved
-        ChildCount = [int]$Task.ChildCount
-        ParentUrl = [string]$Task.ParentUrl
-        SourceXml = [string]$Task.SourceXml
-    }
+    return @($results)
 }
 
 function Save-MhtmlPage {
@@ -1220,20 +1702,37 @@ function New-WorkerSuccessResult {
         $Result
     )
 
+    $results = @($Result)
+    $first = if ($results.Count -gt 0) { $results[0] } else { $null }
+
     return [pscustomobject]@{
         WorkerResult = $true
         WorkerId = $Id
         TaskId = $TaskId
         Success = $true
-        OriginalUrl = $Result.OriginalUrl
-        FinalUrl = $Result.FinalUrl
-        Title = $Result.Title
-        FilePath = $Result.FilePath
-        RelativeFile = (ConvertTo-RelativeRootPath $Result.FilePath)
-        Saved = $Result.Saved
-        ChildCount = $Result.ChildCount
-        ParentUrl = $Result.ParentUrl
-        SourceXml = $Result.SourceXml
+        OriginalUrl = if ($first) { $first.OriginalUrl } else { '' }
+        FinalUrl = if ($first) { $first.FinalUrl } else { '' }
+        Title = if ($first) { $first.Title } else { '' }
+        FilePath = if ($first) { $first.FilePath } else { '' }
+        RelativeFile = if ($first) { ConvertTo-RelativeRootPath $first.FilePath } else { '' }
+        Saved = if ($first) { $first.Saved } else { $false }
+        ChildCount = if ($first) { $first.ChildCount } else { 0 }
+        ParentUrl = if ($first) { $first.ParentUrl } else { '' }
+        SourceXml = if ($first) { $first.SourceXml } else { '' }
+        Results = @($results | ForEach-Object {
+            $item = $_
+            [pscustomobject]@{
+                OriginalUrl = $item.OriginalUrl
+                FinalUrl = $item.FinalUrl
+                Title = $item.Title
+                FilePath = $item.FilePath
+                RelativeFile = (ConvertTo-RelativeRootPath $item.FilePath)
+                Saved = $item.Saved
+                ChildCount = $item.ChildCount
+                ParentUrl = $item.ParentUrl
+                SourceXml = $item.SourceXml
+            }
+        })
         Error = ''
     }
 }
@@ -1383,7 +1882,15 @@ function Add-DownloadedResultToList {
         }
     }
 
-    if ($urlKey -and $ResumeMap.UrlMap.ContainsKey($urlKey)) {
+    $fileKey = ''
+    try {
+        $fileKey = ([System.IO.Path]::GetFullPath([string]$Result.FilePath)).ToLowerInvariant()
+    }
+    catch {
+        $fileKey = ([string]$Result.FilePath).ToLowerInvariant()
+    }
+
+    if ($ResumeMap.PSObject.Properties['FileMap'] -and $fileKey -and $ResumeMap.FileMap.ContainsKey($fileKey)) {
         return
     }
 
@@ -1401,6 +1908,9 @@ function Add-DownloadedResultToList {
     Update-ListBackup -ListPath $listPath
     if ($urlKey) {
         $ResumeMap.UrlMap[$urlKey] = $true
+    }
+    if ($ResumeMap.PSObject.Properties['FileMap'] -and $fileKey) {
+        $ResumeMap.FileMap[$fileKey] = $true
     }
     $ResumeMap.Count = $ResumeMap.UrlMap.Count
 }
@@ -1739,10 +2249,12 @@ if ($ParallelPages -le 1) {
 
         $started++
         try {
-            $result = Save-MhtmlPage -Task $task
-            $result | Add-Member -NotePropertyName RelativeFile -NotePropertyValue (ConvertTo-RelativeRootPath $result.FilePath) -Force
-            $downloaded++
-            Add-DownloadedResultToList -Result $result -ResumeMap $downloadedResumeMap
+            $results = @(Save-MhtmlPage -Task $task)
+            foreach ($result in $results) {
+                $result | Add-Member -NotePropertyName RelativeFile -NotePropertyValue (ConvertTo-RelativeRootPath $result.FilePath) -Force
+                $downloaded++
+                Add-DownloadedResultToList -Result $result -ResumeMap $downloadedResumeMap
+            }
         }
         catch {
             if ($started -gt 0) {
@@ -1785,10 +2297,13 @@ else {
                 $result = Receive-WorkerResult -Worker $worker
                 if ($result) {
                     if ($result.Success) {
-                        $downloaded++
-                        Add-DownloadedResultToList -Result $result -ResumeMap $downloadedResumeMap
+                        $workerResults = if ($result.PSObject.Properties['Results'] -and $result.Results) { @($result.Results) } else { @($result) }
+                        foreach ($workerResult in $workerResults) {
+                            $downloaded++
+                            Add-DownloadedResultToList -Result $workerResult -ResumeMap $downloadedResumeMap
 
-                        Write-Host "Simpan: $($result.RelativeFile)"
+                            Write-Host "Simpan: $($workerResult.RelativeFile)"
+                        }
                     }
                     else {
                         if ($started -gt 0) {
