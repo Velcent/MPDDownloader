@@ -838,7 +838,8 @@ function Assert-PageLoadOk {
 
     $title = [string]$Data.title
     $h1 = [string]$Data.h1
-    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|refused|unreachable|timed out|can''t be reached)\b') {
+    $hasContentItemHeaderMeta = $Data.PSObject.Properties.Name -contains 'hasContentMeta' -and [bool]$Data.hasContentMeta
+    if (-not $hasContentItemHeaderMeta -and "$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|refused|unreachable|can''t be reached)\b') {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
 }
@@ -1103,8 +1104,7 @@ function Get-LearningDetailDataInSession {
         }
         catch {
             $errorMessage = $_.Exception.Message
-            $isRetryable = $errorMessage -match '(?i)\b(HTTP\s*429|429|too many requests|rate limit|Network error|ERR_|Timeout load)\b'
-            if (-not $isRetryable -or $attempt -ge $MaxLoadAttempts) {
+            if ($attempt -ge $MaxLoadAttempts) {
                 throw
             }
             Write-Warning "$errorMessage Reload detail learning: $PageUrl"
