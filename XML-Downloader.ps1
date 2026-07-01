@@ -697,10 +697,23 @@ function Get-LearningDetailSnapshotExpression {
   };
   const readLearningPathChildren = () => {
     if (!document.querySelector('h2.learning-path-title')) return [];
-    const anchors = Array.from(document.querySelectorAll('a.list-item-link[href]'));
+    const anchors = Array.from(document.querySelectorAll([
+      'ul.learning-path-list li.list-step li.list-item a.list-item-link[href]',
+      'ul.learning-path-list a.list-item-link[href]',
+      'learning-step-list li.list-step a.list-item-link[href]',
+      'learning-step-list a.list-item-link[href]'
+    ].join(',')));
     return uniqueChildren(anchors.map((anchor, index) => {
       const stepNumber = parseStepNumber(anchor.querySelector('.list-item-step-number')?.textContent || '');
-      const title = normalize(anchor.querySelector('.list-item-step-title')?.textContent || anchor.textContent || anchor.getAttribute('aria-label') || '');
+      const title = normalize(
+        anchor.querySelector('.list-item-step-title')?.textContent ||
+        anchor.querySelector('.list-item-title')?.textContent ||
+        anchor.querySelector('h1, h2, h3, h4, h5, h6')?.textContent ||
+        anchor.getAttribute('aria-label') ||
+        anchor.getAttribute('title') ||
+        anchor.textContent ||
+        ''
+      );
       return {
         title,
         url: toUrl(anchor.getAttribute('href')),
