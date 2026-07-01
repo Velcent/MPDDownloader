@@ -60,6 +60,42 @@ function ConvertTo-XmlAttributeValue {
     return [System.Security.SecurityElement]::Escape([string]$Value)
 }
 
+function Get-LearningParentMatchKeys {
+    param([string]$Url)
+
+    $keys = [System.Collections.Generic.List[string]]::new()
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return @()
+    }
+
+    $clean = ConvertTo-CleanUrl $Url
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        return @()
+    }
+
+    $key = Get-CanonicalUrlKey -PageUrl $clean
+    if (-not $keys.Contains($key)) {
+        $keys.Add($key)
+    }
+
+    try {
+        $uri = [Uri]$clean
+        $segments = @($uri.AbsolutePath.Trim('/').Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($segments.Count -gt 5 -and $segments[0] -ieq 'community' -and $segments[1] -ieq 'learning' -and $segments[2] -ieq 'courses') {
+            $basePath = '/' + (($segments | Select-Object -First 5) -join '/')
+            $baseUrl = "$($uri.Scheme.ToLowerInvariant())://$($uri.Host.ToLowerInvariant())$basePath"
+            $baseKey = Get-CanonicalUrlKey -PageUrl $baseUrl
+            if (-not $keys.Contains($baseKey)) {
+                $keys.Add($baseKey)
+            }
+        }
+    }
+    catch {
+    }
+
+    return @($keys)
+}
+
 function ConvertTo-RelativeRootPath {
     param([string]$Path)
 
@@ -108,7 +144,10 @@ function Get-LearningUrlFromListHtml {
 }
 
 function ConvertTo-CleanLearningListHtml {
-    param([string]$Html)
+    param(
+        [string]$Html,
+        [string]$ParentUrl = ''
+    )
 
     if ([string]::IsNullOrWhiteSpace($Html)) {
         return ''
@@ -118,7 +157,13 @@ function ConvertTo-CleanLearningListHtml {
         param($Match)
 
         $href = [System.Net.WebUtility]::HtmlDecode([string]$Match.Groups[1].Value)
-        $cleanHref = ConvertTo-CleanUrl $href
+        $isLearningHref = $href -match '(?i)(?:^https://dev\.epicgames\.com)?/community/learning/'
+        if ($isLearningHref -and -not [string]::IsNullOrWhiteSpace($ParentUrl)) {
+            $cleanHref = ConvertTo-CleanUrl $ParentUrl
+        }
+        else {
+            $cleanHref = ConvertTo-CleanUrl $href
+        }
 
         return 'href="{0}"' -f (ConvertTo-XmlAttributeValue $cleanHref)
     })
@@ -142,7 +187,9 @@ function Write-LearningXml {
         if ($anchor) {
             $href = ConvertTo-CleanUrl ([string]$anchor.GetAttribute('href'))
             if (-not [string]::IsNullOrWhiteSpace($href)) {
-                [void]$parentKeys.Add((Get-CanonicalUrlKey -PageUrl $href))
+                foreach ($parentKey in @(Get-LearningParentMatchKeys -Url $href)) {
+                    [void]$parentKeys.Add($parentKey)
+                }
             }
         }
     }
@@ -253,6 +300,29 @@ function Get-LearningXmlParentKeys {
     return @($keys)
 }
 
+function Get-LearningXmlParentEntries {
+    param([string]$Path)
+
+    $content = Get-Content -LiteralPath $Path -Raw
+    [xml]$xml = "<root>$content</root>"
+    $entries = New-Object System.Collections.ArrayList
+    foreach ($anchor in @($xml.SelectNodes("/root/ul[contains(concat(' ', normalize-space(@class), ' '), ' contents-table-list ')]/li/div[contains(concat(' ', normalize-space(@class), ' '), ' contents-table-el ')]/a"))) {
+        $href = ConvertTo-CleanUrl ([string]$anchor.GetAttribute('href'))
+        if ([string]::IsNullOrWhiteSpace($href)) {
+            continue
+        }
+
+        [void]$entries.Add([pscustomobject]@{
+            Key = Get-CanonicalUrlKey -PageUrl $href
+            Keys = @(Get-LearningParentMatchKeys -Url $href)
+            Url = $href
+            Title = ConvertTo-SafeText ([string]$anchor.InnerText)
+        })
+    }
+
+    return @($entries)
+}
+
 function Get-LearningListEntries {
     param([string]$Path)
 
@@ -292,7 +362,8 @@ function Get-LearningListEntries {
 function Sync-LearningListXml {
     param(
         [string]$XmlPath,
-        [string]$ListPath
+        [string]$ListPath,
+        [string]$ReportPath
     )
 
     if (-not (Test-Path -LiteralPath $ListPath)) {
@@ -303,10 +374,16 @@ function Sync-LearningListXml {
         }
     }
 
-    $parentKeys = @(Get-LearningXmlParentKeys -Path $XmlPath)
+    $parentEntries = @(Get-LearningXmlParentEntries -Path $XmlPath)
+    $parentKeySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($parent in $parentEntries) {
+        foreach ($key in @($parent.Keys)) {
+            [void]$parentKeySet.Add([string]$key)
+        }
+    }
     $entries = @(Get-LearningListEntries -Path $ListPath)
     $sourceLength = (Get-Item -LiteralPath $ListPath).Length
-    if ($parentKeys.Count -eq 0) {
+    if ($parentEntries.Count -eq 0) {
         Write-Warning "Skip patch list karena parent XML tidak terbaca: $(ConvertTo-RelativeRootPath $XmlPath)"
         return [pscustomobject]@{
             Updated = $false
@@ -324,25 +401,77 @@ function Sync-LearningListXml {
     }
 
     $entriesByKey = @{}
+    $duplicateListKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($entry in $entries) {
         if (-not $entriesByKey.ContainsKey($entry.Key)) {
             $entriesByKey[$entry.Key] = $entry
+        }
+        else {
+            [void]$duplicateListKeys.Add([string]$entry.Key)
+        }
+    }
+
+    $matchedListKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $reportLines = New-Object System.Collections.ArrayList
+    [void]$reportLines.Add("Status`tKey`tUrl`tTitle")
+    $missingCount = 0
+    foreach ($parent in $parentEntries) {
+        $matchedEntry = $null
+        foreach ($key in @($parent.Keys)) {
+            if ($entriesByKey.ContainsKey($key)) {
+                $matchedEntry = $entriesByKey[$key]
+                break
+            }
+        }
+
+        if (-not $matchedEntry) {
+            $title = ([string]$parent.Title) -replace "`t", ' ' -replace "`r?`n", ' '
+            [void]$reportLines.Add(("MissingInList`t{0}`t{1}`t{2}" -f $parent.Key, $parent.Url, $title))
+            $missingCount++
+        }
+        else {
+            [void]$matchedListKeys.Add([string]$matchedEntry.Key)
         }
     }
 
     $lines = New-Object System.Collections.ArrayList
     $kept = 0
-    foreach ($key in $parentKeys) {
-        if (-not $entriesByKey.ContainsKey($key)) {
+    foreach ($parent in $parentEntries) {
+        $entry = $null
+        foreach ($key in @($parent.Keys)) {
+            if ($entriesByKey.ContainsKey($key)) {
+                $entry = $entriesByKey[$key]
+                break
+            }
+        }
+
+        if (-not $entry) {
             continue
         }
 
-        $entry = $entriesByKey[$key]
         if (-not [string]::IsNullOrWhiteSpace([string]$entry.Comment)) {
             [void]$lines.Add([string]$entry.Comment)
         }
-        [void]$lines.Add((ConvertTo-CleanLearningListHtml -Html ([string]$entry.Html)))
+        [void]$lines.Add((ConvertTo-CleanLearningListHtml -Html ([string]$entry.Html) -ParentUrl ([string]$parent.Url)))
         $kept++
+    }
+
+    $extraCount = 0
+    $duplicateCount = 0
+    foreach ($entry in $entries) {
+        $entryUrl = ConvertTo-CleanUrl ([string](Get-LearningUrlFromListHtml -Html ([string]$entry.Html)))
+        if (-not $matchedListKeys.Contains([string]$entry.Key) -and -not $parentKeySet.Contains([string]$entry.Key)) {
+            [void]$reportLines.Add(("ExtraInList`t{0}`t{1}`t" -f $entry.Key, $entryUrl))
+            $extraCount++
+        }
+        elseif ($duplicateListKeys.Contains([string]$entry.Key) -and -not [object]::ReferenceEquals($entry, $entriesByKey[$entry.Key])) {
+            [void]$reportLines.Add(("DuplicateInList`t{0}`t{1}`t" -f $entry.Key, $entryUrl))
+            $duplicateCount++
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ReportPath)) {
+        Set-Content -LiteralPath $ReportPath -Value ([string[]]$reportLines.ToArray()) -Encoding UTF8
     }
 
     Set-Content -LiteralPath $ListPath -Value ([string[]]$lines.ToArray()) -Encoding UTF8
@@ -350,12 +479,16 @@ function Sync-LearningListXml {
         Updated = $true
         Kept = $kept
         Removed = [Math]::Max(0, $entries.Count - $kept)
+        Missing = $missingCount
+        Extra = $extraCount
+        Duplicate = $duplicateCount
     }
 }
 
 foreach ($key in $Keys) {
     $path = Join-Path $MhtmlRoot "$key.xml"
     $listPath = Join-Path $MhtmlRoot "$key-list.xml"
+    $reportPath = Join-Path $MhtmlRoot "$key-patch.tsv"
     if (-not (Test-Path -LiteralPath $path)) {
         Write-Warning "File tidak ditemukan: $(ConvertTo-RelativeRootPath $path)"
         continue
@@ -378,9 +511,10 @@ foreach ($key in $Keys) {
     $patchResult = Write-LearningXml -Xml $xml -Path $path
     Write-Host "Patch XML: $(ConvertTo-RelativeRootPath $path) ($($patchResult.RemovedParents) link duplikat dihapus, $($patchResult.RemovedChildren) child duplikat dihapus)"
 
-    $listResult = Sync-LearningListXml -XmlPath $path -ListPath $listPath
+    $listResult = Sync-LearningListXml -XmlPath $path -ListPath $listPath -ReportPath $reportPath
     if ($listResult.Updated) {
-        Write-Host "Patch list: $(ConvertTo-RelativeRootPath $listPath) ($($listResult.Kept) cocok XML, $($listResult.Removed) dibuang)"
+        Write-Host "Patch list: $(ConvertTo-RelativeRootPath $listPath) ($($listResult.Kept) cocok XML, $($listResult.Removed) dibuang, $($listResult.Missing) kurang, $($listResult.Extra) kelebihan, $($listResult.Duplicate) duplikat)"
+        Write-Host "Report: $(ConvertTo-RelativeRootPath $reportPath)"
     }
     else {
         Write-Warning "List tidak ditemukan: $(ConvertTo-RelativeRootPath $listPath)"

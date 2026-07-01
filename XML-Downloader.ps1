@@ -682,9 +682,13 @@ function Get-LearningDetailSnapshotExpression {
   };
   const readCourseChildren = () => {
     const nav = document.querySelector('nav-course');
-    const list = nav?.querySelector('ul.course-steps-list');
-    if (!list) return [];
-    const anchors = Array.from(list.querySelectorAll('li.course-steps-link a[href], li .course-steps-link a[href], a.course-steps-link[href], li a[href]'));
+    if (!nav) return [];
+    const anchors = Array.from(nav.querySelectorAll([
+      'ul.course-steps-list a.course-steps-link[href]',
+      'ul.course-steps-list li.course-steps-item a[href]',
+      'ul.course-steps-list li a[href]',
+      '.course-sidebar-steps a.course-steps-link[href]'
+    ].join(',')));
     return uniqueChildren(anchors.map((anchor, index) => ({
       title: normalize(anchor.textContent || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || ''),
       url: toUrl(anchor.getAttribute('href')),
@@ -1865,7 +1869,7 @@ function ConvertTo-LearningListXml {
 
     $lines = New-Object System.Collections.ArrayList
     foreach ($item in @($Items)) {
-        $html = ConvertTo-CleanLearningListHtml -Html ([string]$item.html)
+        $html = ConvertTo-CleanLearningListHtml -Html ([string]$item.html) -ParentUrl ([string]$item.url)
         if ([string]::IsNullOrWhiteSpace($html)) {
             continue
         }
@@ -1880,7 +1884,10 @@ function ConvertTo-LearningListXml {
 }
 
 function ConvertTo-CleanLearningListHtml {
-    param([string]$Html)
+    param(
+        [string]$Html,
+        [string]$ParentUrl = ''
+    )
 
     if ([string]::IsNullOrWhiteSpace($Html)) {
         return ''
@@ -1890,7 +1897,13 @@ function ConvertTo-CleanLearningListHtml {
         param($Match)
 
         $href = [System.Net.WebUtility]::HtmlDecode([string]$Match.Groups[1].Value)
-        $cleanHref = ConvertTo-CleanUrl $href
+        $isLearningHref = $href -match '(?i)(?:^https://dev\.epicgames\.com)?/community/learning/'
+        if ($isLearningHref -and -not [string]::IsNullOrWhiteSpace($ParentUrl)) {
+            $cleanHref = ConvertTo-CleanUrl $ParentUrl
+        }
+        else {
+            $cleanHref = ConvertTo-CleanUrl $href
+        }
 
         return 'href="{0}"' -f (ConvertTo-XmlAttributeValue $cleanHref)
     })
@@ -2047,7 +2060,9 @@ function Get-LearningCache {
     for ($index = 0; $index -lt $xmlItems.Count; $index++) {
         $item = $xmlItems[$index]
         if ($index -lt $listItems.Count) {
-            $item.originalUrl = [string]$listItems[$index].url
+            if ([string]::IsNullOrWhiteSpace([string]$item.originalUrl)) {
+                $item.originalUrl = [string]$listItems[$index].url
+            }
             $item.html = [string]$listItems[$index].html
             if ([string]::IsNullOrWhiteSpace([string]$item.publishedAt)) {
                 $item.publishedAt = [string]$listItems[$index].publishedAt
