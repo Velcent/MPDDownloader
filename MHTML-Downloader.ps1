@@ -901,7 +901,7 @@ function Get-MhtmlSnippetPrepareExpression {
     return text;
   };
   const textOf = (el) => el ? decodeEntities(el.value || el.innerText || el.textContent || '') : '';
-  const snippetType = (snippet) => snippet.querySelector('blueprint-render') ? 'blueprint' : 'code';
+  const snippetType = (snippet) => snippet.querySelector('blueprint-render, .blueprint-render') ? 'blueprint' : 'code';
   const sourceLooksUseful = (text, type) => {
     const value = (text || '').trim();
     if (!value) return false;
@@ -916,6 +916,9 @@ function Get-MhtmlSnippetPrepareExpression {
     const text = (source || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n$/, '');
     return text.length ? text.split('\n').length : 0;
   };
+  const sourceLineCountMatches = (expectedLineCount, sourceLineCount) => {
+    return expectedLineCount <= 0 || sourceLineCount === expectedLineCount || sourceLineCount === expectedLineCount - 1;
+  };
   const isOwnedBySnippet = (snippet, el) => {
     const ownerSnippet = el.closest?.('block-code-snippet');
     return !ownerSnippet || ownerSnippet === snippet;
@@ -925,7 +928,7 @@ function Get-MhtmlSnippetPrepareExpression {
   };
   const findEpicTextareaSource = (snippet, type) => {
     const nodes = sourceRootsFor(snippet)
-      .flatMap(root => Array.from(root.querySelectorAll('textarea')))
+      .flatMap(root => Array.from(root.querySelectorAll('textarea:not(.mhtml-full-snippet-source)')))
       .filter(el => isOwnedBySnippet(snippet, el));
     const texts = nodes.map(textOf).filter(text => sourceLooksUseful(text, type));
     texts.sort((a, b) => b.length - a.length);
@@ -934,7 +937,7 @@ function Get-MhtmlSnippetPrepareExpression {
   const findDomSource = (snippet, type) => {
     const nodes = sourceRootsFor(snippet)
       .flatMap(root => Array.from(root.querySelectorAll('[data-full-source], [data-source], [class*="full-source" i], [class*="raw-source" i]')))
-      .filter(el => isOwnedBySnippet(snippet, el) && !el.closest?.('blueprint-render'));
+      .filter(el => isOwnedBySnippet(snippet, el) && !el.closest?.('blueprint-render') && !el.classList?.contains('mhtml-full-snippet-source'));
     const texts = nodes.map(el => decodeEntities(
       el.getAttribute('data-full-source') ||
       el.getAttribute('data-source') ||
@@ -943,29 +946,60 @@ function Get-MhtmlSnippetPrepareExpression {
     texts.sort((a, b) => b.length - a.length);
     return texts[0] || '';
   };
-  const findCopyButton = (snippet) => {
-    const actionRoots = Array.from(snippet.querySelectorAll('.block-code-snippet-actions, [class*="snippet-actions" i]'));
-    const roots = actionRoots.length ? actionRoots : [snippet];
-    const candidates = roots.flatMap(root => Array.from(root.querySelectorAll('button, [role="button"], a')));
-    const scored = candidates.filter(visible).map(button => {
-      const label = normalize([
+  const scoreCopyButton = (button) => {
+    const label = normalize([
         button.innerText,
         button.textContent,
         button.getAttribute('aria-label'),
         button.getAttribute('title'),
         button.getAttribute('data-tooltip'),
         button.getAttribute('mattooltip')
-      ].filter(Boolean).join(' '));
-      let score = 0;
-      if (/copy/i.test(label)) score += 4;
-      if (/full/i.test(label)) score += 3;
-      if (/snippet|code/i.test(label)) score += 2;
-      if (/expand/i.test(label)) score -= 10;
-      if ((button.className || '').toString().match(/copy/i)) score += 2;
-      return { button, label, score };
-    }).filter(item => item.score > 0);
+    ].filter(Boolean).join(' '));
+    let score = 0;
+    if (/copy/i.test(label)) score += 4;
+    if (/full/i.test(label)) score += 3;
+    if (/snippet|code/i.test(label)) score += 2;
+    if (/expand/i.test(label)) score -= 10;
+    if ((button.className || '').toString().match(/copy/i)) score += 2;
+    return { button, label, score };
+  };
+  const findCopyButton = (snippet) => {
+    const actionRoots = Array.from(snippet.querySelectorAll('.block-code-snippet-actions, [class*="snippet-actions" i]'));
+    const roots = actionRoots.length ? actionRoots : [snippet];
+    const candidates = roots.flatMap(root => Array.from(root.querySelectorAll('button, [role="button"], a')));
+    const scored = candidates.filter(visible).map(scoreCopyButton).filter(item => item.score > 0);
     scored.sort((a, b) => b.score - a.score);
     return scored[0] || null;
+  };
+  const sourceRootForLooseCopyButton = (button) => {
+    let node = button.parentElement;
+    for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+      if (node.closest?.('block-code-snippet')) return null;
+      if (
+        node.querySelector?.('textarea:not(.mhtml-full-snippet-source)') ||
+        node.querySelector?.('blueprint-render, .blueprint-render') ||
+        node.querySelector?.('pre.block-code-snippet-plain, pre code')
+      ) {
+        return node;
+      }
+    }
+    return null;
+  };
+  const findLooseCopyTargets = () => {
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'))
+      .filter(button => !button.closest?.('block-code-snippet') && !button.closest?.('pre.block-code-snippet-plain'))
+      .filter(visible)
+      .map(scoreCopyButton)
+      .filter(item => item.score > 0 && (/copy/i.test(item.label) || expectedLineCountFromLabel(item.label) > 0));
+    const seen = new Set();
+    const targets = [];
+    for (const item of buttons.sort((a, b) => b.score - a.score)) {
+      const root = sourceRootForLooseCopyButton(item.button);
+      if (!root || seen.has(root)) continue;
+      seen.add(root);
+      targets.push({ root, button: item.button, label: item.label });
+    }
+    return targets;
   };
   const waitForSnippetSource = async (snippet, type) => {
     let bestSource = '';
@@ -986,6 +1020,52 @@ function Get-MhtmlSnippetPrepareExpression {
 
     return { source: bestSource, fromTextarea };
   };
+  const writeTextareaSource = (textarea, source, type, metadata = {}) => {
+    textarea.className = 'mhtml-full-snippet-source';
+    textarea.setAttribute('aria-hidden', 'true');
+    textarea.setAttribute('readonly', 'readonly');
+    textarea.setAttribute('tabindex', '-1');
+    textarea.setAttribute('data-mhtml-full-source', 'true');
+    textarea.setAttribute('data-snippet-type', type);
+    textarea.setAttribute('data-source-length', String((source || '').length));
+    textarea.setAttribute('data-source-lines', String(countSourceLines(source)));
+    if (metadata.expectedLineCount > 0) textarea.setAttribute('data-expected-lines', String(metadata.expectedLineCount));
+    if (metadata.buttonLabel) textarea.setAttribute('data-copy-button-label', metadata.buttonLabel);
+    textarea.style.cssText = 'display:block !important; position:absolute !important; left:-100000px !important; top:auto !important; width:1px !important; height:1px !important; opacity:0 !important; pointer-events:none !important;';
+    textarea.value = source || '';
+    textarea.defaultValue = source || '';
+    textarea.textContent = source || '';
+    return textarea;
+  };
+  const injectSnippetSource = (snippet, source, type, metadata = {}) => {
+    if (!sourceLooksUseful(source, type)) return false;
+    let textarea = Array.from(snippet.children).find(el => el.matches?.('textarea.mhtml-full-snippet-source'));
+    if (!textarea) {
+      textarea = document.createElement('textarea');
+      snippet.appendChild(textarea);
+    }
+    writeTextareaSource(textarea, source, type, metadata);
+    return true;
+  };
+  const legacySourceFor = (pre) => {
+    const next = pre.nextElementSibling;
+    if (next?.matches?.('textarea:not(.mhtml-full-snippet-source)')) {
+      const textareaText = textOf(next);
+      if (sourceLooksUseful(textareaText, 'code')) return { source: textareaText, fromTextarea: true };
+    }
+    const code = pre.querySelector('code') || pre;
+    return { source: textOf(code), fromTextarea: false };
+  };
+  const injectLegacySource = (pre, source) => {
+    if (!sourceLooksUseful(source, 'code')) return false;
+    let textarea = pre.nextElementSibling?.matches?.('textarea.mhtml-full-snippet-source') ? pre.nextElementSibling : null;
+    if (!textarea) {
+      textarea = document.createElement('textarea');
+      pre.insertAdjacentElement('afterend', textarea);
+    }
+    writeTextareaSource(textarea, source, 'code', {});
+    return true;
+  };
   const processSnippet = async (snippet, index) => {
     const expectedType = snippetType(snippet);
     const copy = findCopyButton(snippet);
@@ -1005,23 +1085,84 @@ function Get-MhtmlSnippetPrepareExpression {
     const source = waitResult.source || '';
     const type = expectedType;
     const sourceLineCount = countSourceLines(source);
+    const injected = injectSnippetSource(snippet, source, type, { expectedLineCount, buttonLabel });
     return {
       index,
       type,
       clicked: !!button,
       buttonLabel,
       filled: sourceLooksUseful(source, type),
+      injected,
       fromTextarea: !!waitResult.fromTextarea,
       sourceLength: (source || '').length,
       expectedLineCount,
       sourceLineCount,
-      lineCountOk: expectedLineCount <= 0 || sourceLineCount === expectedLineCount,
+      lineCountOk: sourceLineCountMatches(expectedLineCount, sourceLineCount),
+      sourceHead: normalize((source || '').split(/\r?\n/).find(line => line.trim()) || '').slice(0, 160)
+    };
+  };
+  const processLegacySnippet = (pre, offset, index) => {
+    const found = legacySourceFor(pre);
+    const source = found.source || '';
+    const sourceLineCount = countSourceLines(source);
+    const injected = injectLegacySource(pre, source);
+    return {
+      index: offset + index,
+      type: 'code',
+      legacy: true,
+      clicked: false,
+      buttonLabel: '',
+      filled: sourceLooksUseful(source, 'code'),
+      injected,
+      fromTextarea: !!found.fromTextarea,
+      sourceLength: (source || '').length,
+      expectedLineCount: 0,
+      sourceLineCount,
+      lineCountOk: true,
+      sourceHead: normalize((source || '').split(/\r?\n/).find(line => line.trim()) || '').slice(0, 160)
+    };
+  };
+  const processLooseCopyTarget = async (target, offset, index) => {
+    const root = target.root;
+    const type = snippetType(root);
+    const buttonLabel = target.label || '';
+    const expectedLineCount = expectedLineCountFromLabel(buttonLabel);
+    try {
+      target.button.scrollIntoView({ block: 'center', inline: 'nearest' });
+      target.button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+      target.button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+      target.button.click();
+    } catch {}
+
+    const waitResult = await waitForSnippetSource(root, type);
+    const source = waitResult.source || '';
+    const sourceLineCount = countSourceLines(source);
+    const injected = injectSnippetSource(root, source, type, { expectedLineCount, buttonLabel });
+    return {
+      index: offset + index,
+      type,
+      looseCopy: true,
+      clicked: true,
+      buttonLabel,
+      filled: sourceLooksUseful(source, type),
+      injected,
+      fromTextarea: !!waitResult.fromTextarea,
+      sourceLength: (source || '').length,
+      expectedLineCount,
+      sourceLineCount,
+      lineCountOk: sourceLineCountMatches(expectedLineCount, sourceLineCount),
       sourceHead: normalize((source || '').split(/\r?\n/).find(line => line.trim()) || '').slice(0, 160)
     };
   };
   const snippets = Array.from(document.querySelectorAll('block-code-snippet'));
-  const results = await Promise.all(snippets.map((snippet, index) => processSnippet(snippet, index)));
-  return JSON.stringify({ snippetCount: snippets.length, results });
+  const snippetResults = await Promise.all(snippets.map((snippet, index) => processSnippet(snippet, index)));
+  const legacySnippets = Array.from(document.querySelectorAll('pre.block-code-snippet-plain'))
+    .filter(pre => !pre.closest('block-code-snippet'));
+  const legacyResults = legacySnippets.map((pre, index) => processLegacySnippet(pre, snippets.length, index));
+  const looseTargets = findLooseCopyTargets();
+  const looseResults = await Promise.all(looseTargets.map((target, index) => processLooseCopyTarget(target, snippets.length + legacySnippets.length, index)));
+  const results = snippetResults.concat(legacyResults, looseResults);
+  return JSON.stringify({ snippetCount: results.length, blockSnippetCount: snippets.length, legacySnippetCount: legacySnippets.length, looseCopySnippetCount: looseTargets.length, results });
 })()
 '@
 }
@@ -1844,12 +1985,13 @@ function Save-MhtmlPageInSession {
                 $snippetData = $snippetJson | ConvertFrom-Json
                 if ($snippetData -and [int]$snippetData.snippetCount -gt 0) {
                     $filledCount = @($snippetData.results | Where-Object { $_.filled }).Count
+                    $injectedCount = @($snippetData.results | Where-Object { $_.injected }).Count
                     $typeSummary = @($snippetData.results | Group-Object type | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
                     $lineCountChecked = @($snippetData.results | Where-Object { $_.expectedLineCount -gt 0 })
                     $lineCountMatched = @($lineCountChecked | Where-Object { $_.lineCountOk }).Count
                     $lineCountMismatch = @($lineCountChecked | Where-Object { -not $_.lineCountOk })
                     $lineSummary = if ($lineCountChecked.Count -gt 0) { "; line sesuai tombol: $lineCountMatched/$($lineCountChecked.Count)" } else { '' }
-                    Write-Host "Snippet source textarea terisi: $filledCount/$($snippetData.snippetCount) ($typeSummary)$lineSummary"
+                    Write-Host "Snippet source textarea terisi: $filledCount/$($snippetData.snippetCount); source tertanam: $injectedCount/$($snippetData.snippetCount) ($typeSummary)$lineSummary"
                     if ($lineCountMismatch.Count -gt 0) {
                         $mismatchSummary = @($lineCountMismatch | Group-Object type | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
                         Write-Warning "Snippet source jumlah baris tidak sesuai tombol Copy full snippet: $($lineCountMismatch.Count) ($mismatchSummary)"
