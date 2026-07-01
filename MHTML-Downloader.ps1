@@ -36,6 +36,7 @@ $script:MainDocumentStatus = $null
 $script:MainDocumentStatusText = ''
 $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
+$script:MainDocumentFrameId = ''
 $script:KnownUrlMapCache = @{}
 $script:UnrealApplicationVersionFallbacks = @('5.7', '5.6', '5.5', '5.4', '5.3')
 $script:MetaHumanApplicationVersionFallbacks = @('5.7', '5.6', '5.0-5.5')
@@ -254,6 +255,7 @@ function Reset-NetworkState {
     $script:MainDocumentStatusText = ''
     $script:MainDocumentFailedText = ''
     $script:MainDocumentRequestId = ''
+    $script:MainDocumentFrameId = ''
 }
 
 function Update-NetworkStateFromEvent {
@@ -264,11 +266,24 @@ function Update-NetworkStateFromEvent {
     }
 
     if ($Message.method -eq 'Network.requestWillBeSent' -and $Message.params.type -eq 'Document') {
-        $script:MainDocumentRequestId = [string]$Message.params.requestId
+        $frameId = [string]$Message.params.frameId
+        if ($script:MainDocumentFrameId -and $frameId -and $frameId -ne $script:MainDocumentFrameId) {
+            return
+        }
+        if (-not $script:MainDocumentRequestId -or ($script:MainDocumentFrameId -and $frameId -eq $script:MainDocumentFrameId)) {
+            $script:MainDocumentRequestId = [string]$Message.params.requestId
+        }
         return
     }
 
     if ($Message.method -eq 'Network.responseReceived' -and $Message.params.type -eq 'Document') {
+        $frameId = [string]$Message.params.frameId
+        if ($script:MainDocumentFrameId -and $frameId -and $frameId -ne $script:MainDocumentFrameId) {
+            return
+        }
+        if ($script:MainDocumentRequestId -and ([string]$Message.params.requestId) -ne $script:MainDocumentRequestId) {
+            return
+        }
         $script:MainDocumentRequestId = [string]$Message.params.requestId
         $script:MainDocumentStatus = [int]$Message.params.response.status
         $script:MainDocumentStatusText = [string]$Message.params.response.statusText
@@ -277,11 +292,13 @@ function Update-NetworkStateFromEvent {
 
     if ($Message.method -eq 'Network.loadingFailed') {
         $requestId = [string]$Message.params.requestId
+        $frameId = [string]$Message.params.frameId
         $errorText = [string]$Message.params.errorText
         $isDocumentFailure = ([string]$Message.params.type) -eq 'Document'
         $isKnownMainDocument = $script:MainDocumentRequestId -and $requestId -eq $script:MainDocumentRequestId
+        $isMainFrameDocument = $script:MainDocumentFrameId -and $frameId -and $frameId -eq $script:MainDocumentFrameId
 
-        if ($isDocumentFailure -or $isKnownMainDocument) {
+        if ($isKnownMainDocument -or ($isDocumentFailure -and $isMainFrameDocument)) {
             if ($requestId) {
                 $script:MainDocumentRequestId = $requestId
             }
@@ -338,6 +355,10 @@ function Update-NetworkStateFromNavigateResult {
 
     if (-not $Response -or -not $Response.result) {
         return
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Response.result.frameId)) {
+        $script:MainDocumentFrameId = [string]$Response.result.frameId
     }
 
     if (-not [string]::IsNullOrWhiteSpace([string]$Response.result.errorText)) {
@@ -582,6 +603,7 @@ function Get-MhtmlSnapshotExpression {
     .filter(text => /\berror\b/i.test(text));
   const h1 = document.querySelector('h1');
   const htmlLength = document.documentElement?.outerHTML?.length || 0;
+  const hasContentMeta = !!document.querySelector('div.content-item-header-meta');
 
   return JSON.stringify({
     href: location.href,
@@ -589,6 +611,7 @@ function Get-MhtmlSnapshotExpression {
     title: document.title || '',
     h1: normalize(h1?.textContent || ''),
     hasH1: !!h1,
+    hasContentMeta,
     hotToastErrors,
     loadingCount,
     isLoading: document.readyState !== 'complete' || loadingCount > 0,
@@ -1054,7 +1077,16 @@ function New-MhtmlSaveResult {
 }
 
 function Assert-PageLoadOk {
-    param($Data)
+    param(
+        $Data,
+        $Task = $null
+    )
+
+    $title = [string]$Data.title
+    $h1 = [string]$Data.h1
+    $htmlLength = if ($Data.PSObject.Properties['htmlLength']) { [int]$Data.htmlLength } else { 0 }
+    $isLearningSource = $Task -and (Test-LearningXmlSource -SourceXml ([string]$Task.SourceXml))
+    $hasLearningContentMeta = $isLearningSource -and ($Data.PSObject.Properties.Name -contains 'hasContentMeta') -and [bool]$Data.hasContentMeta
 
     if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentFailedText)) {
         if (Test-IgnorableNavigationFailure -ErrorText $script:MainDocumentFailedText) {
@@ -1067,12 +1099,16 @@ function Assert-PageLoadOk {
 
     if ($null -ne $script:MainDocumentStatus -and $script:MainDocumentStatus -ge 400) {
         $statusText = if ($script:MainDocumentStatusText) { " $($script:MainDocumentStatusText)" } else { '' }
-        throw "HTTP $($script:MainDocumentStatus)$statusText"
+        if ($hasLearningContentMeta) {
+            Write-Host "HTTP $($script:MainDocumentStatus)$statusText diabaikan karena Learn detail sudah memuat div.content-item-header-meta."
+            $script:MainDocumentStatus = $null
+            $script:MainDocumentStatusText = ''
+        }
+        else {
+            throw "HTTP $($script:MainDocumentStatus)$statusText"
+        }
     }
 
-    $title = [string]$Data.title
-    $h1 = [string]$Data.h1
-    $htmlLength = if ($Data.PSObject.Properties['htmlLength']) { [int]$Data.htmlLength } else { 0 }
     $hotToastErrors = @()
     if ($Data.PSObject.Properties['hotToastErrors']) {
         $hotToastErrors = @($Data.hotToastErrors | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
@@ -1086,7 +1122,7 @@ function Assert-PageLoadOk {
         throw "Halaman terlihat error challenge: h1='$h1', size=$htmlLength bytes"
     }
 
-    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|refused|unreachable|can''t be reached)\b') {
+    if (-not $hasLearningContentMeta -and "$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|refused|unreachable|can''t be reached)\b') {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
 }
@@ -1763,7 +1799,7 @@ function Save-MhtmlPageInSession {
 
         try {
             $data = Wait-MhtmlPageReady -Socket $Socket -PageUrl $currentPageUrl -Attempt $attempt
-            Assert-PageLoadOk -Data $data
+            Assert-PageLoadOk -Data $data -Task $Task
             Assert-FinalUrlDoesNotPointToKnownDifferentPage -Task $Task -Data $data
 
             $switchJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSwitchDiscoveryExpression) -AwaitPromise
