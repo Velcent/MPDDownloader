@@ -442,6 +442,8 @@ function Get-LearningSnapshotExpression {
     try {
       const url = new URL(value, document.baseURI);
       if (!/^https?:$/i.test(url.protocol)) return '';
+      url.search = '';
+      url.hash = '';
       return url.href;
     } catch (_) {
       return '';
@@ -574,6 +576,7 @@ function Get-DocumentationSnapshotExpression {
     if (!url) return '';
     try {
       const parsed = new URL(url);
+      parsed.search = '';
       parsed.hash = '';
       return parsed.href;
     } catch (_) {
@@ -868,6 +871,32 @@ function Get-CanonicalUrlKey {
     }
     catch {
         return $PageUrl.TrimEnd('/').ToLowerInvariant()
+    }
+}
+
+function ConvertTo-CleanUrl {
+    param([string]$PageUrl)
+
+    if ([string]::IsNullOrWhiteSpace($PageUrl)) {
+        return ''
+    }
+
+    if ($PageUrl -match '(?i)^/(?!/)') {
+        return (($PageUrl -replace '[?#].*$', '').Trim())
+    }
+
+    try {
+        $uri = [Uri]$PageUrl
+        if (-not $uri.IsAbsoluteUri) {
+            return (($PageUrl -replace '[?#].*$', '').Trim())
+        }
+        $builder = [System.UriBuilder]::new($uri)
+        $builder.Query = ''
+        $builder.Fragment = ''
+        return $builder.Uri.AbsoluteUri
+    }
+    catch {
+        return (($PageUrl -replace '[?#].*$', '').Trim())
     }
 }
 
@@ -1792,7 +1821,7 @@ function ConvertTo-LearningXml {
             $parentTitleCounts[$titleKey] = 0
         }
 
-        $href = ConvertTo-XmlAttributeValue ([string]$item.url)
+        $href = ConvertTo-XmlAttributeValue (ConvertTo-CleanUrl ([string]$item.url))
         $label = ConvertTo-XmlAttributeValue $title
         $publishedAt = ConvertTo-XmlAttributeValue ([string]$item.publishedAt)
         $publishedTimestamp = ConvertTo-XmlAttributeValue ([string]$item.publishedTimestamp)
@@ -1816,7 +1845,7 @@ function ConvertTo-LearningXml {
                     $childTitle = $childUrl
                 }
 
-                $childHref = ConvertTo-XmlAttributeValue $childUrl
+                $childHref = ConvertTo-XmlAttributeValue (ConvertTo-CleanUrl $childUrl)
                 $childLabel = ConvertTo-XmlAttributeValue $childTitle
                 [void]$lines.Add("`t`t`t<li class=""contents-table-item"">")
                 [void]$lines.Add("`t`t`t`t<div class=""contents-table-el""><a class=""contents-table-link"" href=""$childHref"">$childLabel</a></div>")
@@ -1836,7 +1865,7 @@ function ConvertTo-LearningListXml {
 
     $lines = New-Object System.Collections.ArrayList
     foreach ($item in @($Items)) {
-        $html = [string]$item.html
+        $html = ConvertTo-CleanLearningListHtml -Html ([string]$item.html)
         if ([string]::IsNullOrWhiteSpace($html)) {
             continue
         }
@@ -1848,6 +1877,23 @@ function ConvertTo-LearningListXml {
     }
 
     return [string[]]$lines.ToArray()
+}
+
+function ConvertTo-CleanLearningListHtml {
+    param([string]$Html)
+
+    if ([string]::IsNullOrWhiteSpace($Html)) {
+        return ''
+    }
+
+    return [regex]::Replace($Html, '(?i)\bhref="([^"]+)"', {
+        param($Match)
+
+        $href = [System.Net.WebUtility]::HtmlDecode([string]$Match.Groups[1].Value)
+        $cleanHref = ConvertTo-CleanUrl $href
+
+        return 'href="{0}"' -f (ConvertTo-XmlAttributeValue $cleanHref)
+    })
 }
 
 function ConvertTo-AbsoluteLearningUrl {
