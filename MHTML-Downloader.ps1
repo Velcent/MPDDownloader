@@ -901,14 +901,20 @@ function Get-MhtmlSnippetPrepareExpression {
     return text;
   };
   const textOf = (el) => el ? decodeEntities(el.value || el.innerText || el.textContent || '') : '';
-  const isBlueprintSource = (text) => /Begin Object[\s\S]*End Object/.test(text || '');
   const snippetType = (snippet) => snippet.querySelector('blueprint-render') ? 'blueprint' : 'code';
   const sourceLooksUseful = (text, type) => {
     const value = (text || '').trim();
     if (!value) return false;
-    if (type === 'blueprint') return isBlueprintSource(value);
     if (/^(copied|copy|copy full snippet)$/i.test(value)) return false;
     return value.length > 0;
+  };
+  const expectedLineCountFromLabel = (label) => {
+    const match = normalize(label).match(/copy full snippet\s*\((\d+)\s+lines?\s+long\)|(\d+)\s+lines?\s+long/i);
+    return match ? Number(match[1] || match[2] || 0) : 0;
+  };
+  const countSourceLines = (source) => {
+    const text = (source || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n$/, '');
+    return text.length ? text.split('\n').length : 0;
   };
   const isOwnedBySnippet = (snippet, el) => {
     const ownerSnippet = el.closest?.('block-code-snippet');
@@ -919,7 +925,7 @@ function Get-MhtmlSnippetPrepareExpression {
   };
   const findEpicTextareaSource = (snippet, type) => {
     const nodes = sourceRootsFor(snippet)
-      .flatMap(root => Array.from(root.querySelectorAll('textarea:not(.mhtml-full-snippet-source)')))
+      .flatMap(root => Array.from(root.querySelectorAll('textarea')))
       .filter(el => isOwnedBySnippet(snippet, el));
     const texts = nodes.map(textOf).filter(text => sourceLooksUseful(text, type));
     texts.sort((a, b) => b.length - a.length);
@@ -959,24 +965,7 @@ function Get-MhtmlSnippetPrepareExpression {
       return { button, label, score };
     }).filter(item => item.score > 0);
     scored.sort((a, b) => b.score - a.score);
-    return scored[0]?.button || null;
-  };
-  const injectTextarea = (snippet, text, type) => {
-    let textarea = snippet.querySelector('textarea.mhtml-full-snippet-source');
-    if (!textarea) {
-      textarea = document.createElement('textarea');
-      textarea.className = 'mhtml-full-snippet-source';
-      snippet.appendChild(textarea);
-    }
-    textarea.removeAttribute('hidden');
-    textarea.setAttribute('aria-hidden', 'true');
-    textarea.setAttribute('readonly', 'readonly');
-    textarea.setAttribute('data-mhtml-hidden', 'true');
-    textarea.setAttribute('data-snippet-type', type);
-    textarea.setAttribute('data-source-length', String((text || '').length));
-    textarea.style.cssText = 'display:block !important; position:absolute !important; left:-100000px !important; top:auto !important; width:1px !important; height:1px !important; opacity:0 !important; pointer-events:none !important;';
-    textarea.value = text || '';
-    textarea.textContent = text || '';
+    return scored[0] || null;
   };
   const waitForSnippetSource = async (snippet, type) => {
     let bestSource = '';
@@ -998,8 +987,11 @@ function Get-MhtmlSnippetPrepareExpression {
     return { source: bestSource, fromTextarea };
   };
   const processSnippet = async (snippet, index) => {
-    const type = snippetType(snippet);
-    const button = findCopyButton(snippet);
+    const expectedType = snippetType(snippet);
+    const copy = findCopyButton(snippet);
+    const button = copy?.button || null;
+    const buttonLabel = copy?.label || '';
+    const expectedLineCount = expectedLineCountFromLabel(buttonLabel);
     if (button) {
       try {
         button.scrollIntoView({ block: 'center', inline: 'nearest' });
@@ -1009,20 +1001,22 @@ function Get-MhtmlSnippetPrepareExpression {
       } catch {}
     }
 
-    const waitResult = await waitForSnippetSource(snippet, type);
+    const waitResult = await waitForSnippetSource(snippet, expectedType);
     const source = waitResult.source || '';
-    if (sourceLooksUseful(source, type)) {
-      injectTextarea(snippet, source, type);
-    }
+    const type = expectedType;
+    const sourceLineCount = countSourceLines(source);
     return {
       index,
       type,
       clicked: !!button,
-      injected: !!snippet.querySelector('textarea.mhtml-full-snippet-source'),
+      buttonLabel,
+      filled: sourceLooksUseful(source, type),
       fromTextarea: !!waitResult.fromTextarea,
       sourceLength: (source || '').length,
-      hasBeginObject: /Begin Object/.test(source || ''),
-      hasEndObject: /End Object/.test(source || '')
+      expectedLineCount,
+      sourceLineCount,
+      lineCountOk: expectedLineCount <= 0 || sourceLineCount === expectedLineCount,
+      sourceHead: normalize((source || '').split(/\r?\n/).find(line => line.trim()) || '').slice(0, 160)
     };
   };
   const snippets = Array.from(document.querySelectorAll('block-code-snippet'));
@@ -1849,11 +1843,23 @@ function Save-MhtmlPageInSession {
                 $snippetJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSnippetPrepareExpression) -AwaitPromise
                 $snippetData = $snippetJson | ConvertFrom-Json
                 if ($snippetData -and [int]$snippetData.snippetCount -gt 0) {
-                    $injectedCount = @($snippetData.results | Where-Object { $_.injected }).Count
-                    $blueprintMissing = @($snippetData.results | Where-Object { $_.type -eq 'blueprint' -and (-not $_.hasBeginObject -or -not $_.hasEndObject) }).Count
-                    Write-Host "Snippet full source: $injectedCount/$($snippetData.snippetCount) injected"
-                    if ($blueprintMissing -gt 0) {
-                        Write-Warning "Blueprint snippet tanpa Begin Object/End Object setelah copy: $blueprintMissing"
+                    $filledCount = @($snippetData.results | Where-Object { $_.filled }).Count
+                    $typeSummary = @($snippetData.results | Group-Object type | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
+                    $lineCountChecked = @($snippetData.results | Where-Object { $_.expectedLineCount -gt 0 })
+                    $lineCountMatched = @($lineCountChecked | Where-Object { $_.lineCountOk }).Count
+                    $lineCountMismatch = @($lineCountChecked | Where-Object { -not $_.lineCountOk })
+                    $lineSummary = if ($lineCountChecked.Count -gt 0) { "; line sesuai tombol: $lineCountMatched/$($lineCountChecked.Count)" } else { '' }
+                    Write-Host "Snippet source textarea terisi: $filledCount/$($snippetData.snippetCount) ($typeSummary)$lineSummary"
+                    if ($lineCountMismatch.Count -gt 0) {
+                        $mismatchSummary = @($lineCountMismatch | Group-Object type | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
+                        Write-Warning "Snippet source jumlah baris tidak sesuai tombol Copy full snippet: $($lineCountMismatch.Count) ($mismatchSummary)"
+                        $mismatchDetails = @($lineCountMismatch | Select-Object -First 5 | ForEach-Object {
+                                "#$($_.index) $($_.type) expected=$($_.expectedLineCount) actual=$($_.sourceLineCount): $($_.buttonLabel)"
+                            }) -join ' | '
+                        if (-not [string]::IsNullOrWhiteSpace($mismatchDetails)) {
+                            Write-Warning "Detail snippet line mismatch: $mismatchDetails"
+                        }
+                        throw "Snippet source jumlah baris tidak sesuai tombol Copy full snippet: $($lineCountMismatch.Count) ($mismatchSummary)"
                     }
                 }
 
