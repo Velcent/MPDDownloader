@@ -55,6 +55,31 @@ function Get-MhtmlPartText {
     return Convert-QuotedPrintableText $rest
 }
 
+function Get-MhtmlPartTextByContentLocation {
+    param(
+        [string]$MhtmlText,
+        [scriptblock]$Predicate
+    )
+
+    $pattern = "(?smi)^Content-Location:\s*(?<url>[^\r\n]+)\s*\r?\n(?<rest>.*?)(?=^------|\z)"
+    foreach ($match in [regex]::Matches($MhtmlText, $pattern)) {
+        $contentLocation = [System.Net.WebUtility]::HtmlDecode($match.Groups['url'].Value.Trim()).Replace('\/', '/')
+        if (-not (& $Predicate $contentLocation)) {
+            continue
+        }
+
+        $rest = $match.Groups['rest'].Value
+        $bodyStart = [regex]::Match($rest, "\r?\n\r?\n")
+        if ($bodyStart.Success) {
+            $rest = $rest.Substring($bodyStart.Index + $bodyStart.Length)
+        }
+
+        return Convert-QuotedPrintableText $rest
+    }
+
+    return $null
+}
+
 function Get-VideoIdFromEmbedUrl {
     param([string]$Url)
 
@@ -136,6 +161,79 @@ function Get-YoutubeEmbedUrlsFromMhtml {
             }
         }
     }
+}
+
+function Get-YoutubeEmbedHtmlFromMhtml {
+    param(
+        [string]$MhtmlText,
+        [string]$VideoId
+    )
+
+    return Get-MhtmlPartTextByContentLocation -MhtmlText $MhtmlText -Predicate {
+        param([string]$ContentLocation)
+
+        if ($ContentLocation -notmatch '(?i)(youtube|youtu\.be)') {
+            return $false
+        }
+
+        return (Get-YoutubeVideoIdFromUrl $ContentLocation) -eq $VideoId
+    }
+}
+
+function New-YoutubeEmbedHtml {
+    param([string]$VideoId)
+
+    $embedUrl = "https://www.youtube.com/embed/$VideoId"
+    return @"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: #000;
+}
+
+iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+</style>
+</head>
+<body>
+<iframe src="$embedUrl" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+</body>
+</html>
+"@
+}
+
+function Save-YoutubeEmbedHtml {
+    param(
+        [string]$MhtmlText,
+        [string]$VideoId,
+        [string]$HtmlPath
+    )
+
+    if (Test-Path -LiteralPath $HtmlPath) {
+        Write-Host "Skipping embed HTML: $(Split-Path -Leaf $HtmlPath) already exists"
+        return
+    }
+
+    $html = Get-YoutubeEmbedHtmlFromMhtml -MhtmlText $MhtmlText -VideoId $VideoId
+    if ([string]::IsNullOrWhiteSpace($html)) {
+        $html = Get-RemoteText "https://www.youtube.com/embed/$VideoId"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($html)) {
+        $html = New-YoutubeEmbedHtml -VideoId $VideoId
+    }
+
+    [System.IO.File]::WriteAllText($HtmlPath, $html, [System.Text.UTF8Encoding]::new($false))
+    Write-Host "Saved YouTube embed HTML: $(Split-Path -Leaf $HtmlPath)"
 }
 
 function Get-LocalMp4UrlsFromMhtml {
@@ -911,10 +1009,12 @@ foreach ($mhtmlFile in $mhtmlFiles) {
         }
 
         $mp4Path = Join-Path $Mp4Dir "$youtubeId.mp4"
+        $htmlPath = Join-Path $HtmlDir "$youtubeId.html"
         [void](Restore-Mp4FromOld -Mp4Path $mp4Path)
 
         Write-Host ""
         Write-Host "YouTube: $youtubeId"
+        Save-YoutubeEmbedHtml -MhtmlText $mhtmlText -VideoId $youtubeId -HtmlPath $htmlPath
 
         if ($localVideoIds.ContainsKey($youtubeId)) {
             Write-Host "Skipping online download: local MP4 URL found for $youtubeId"

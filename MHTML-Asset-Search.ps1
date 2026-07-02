@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
-    [string]$Url,
+    [Parameter(Mandatory = $true, Position = 0, ValueFromRemainingArguments = $true)]
+    [string[]]$Url,
     [string]$MhtmlRoot = '',
     [string]$AssetBinRoot = '',
     [string]$OutputPath = ''
@@ -13,7 +13,24 @@ $ErrorActionPreference = 'Stop'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 if (-not $MhtmlRoot) {
-    $MhtmlRoot = Join-Path $PSScriptRoot 'assets\mhtml'
+    $defaultMhtmlRoots = @(
+        [pscustomobject]@{
+            Path = Join-Path $PSScriptRoot 'assets\mhtml'
+            Prefix = ''
+        }
+        [pscustomobject]@{
+            Path = Join-Path $PSScriptRoot 'mhtml'
+            Prefix = 'mhtml/'
+        }
+    )
+}
+else {
+    $defaultMhtmlRoots = @(
+        [pscustomobject]@{
+            Path = $MhtmlRoot
+            Prefix = ''
+        }
+    )
 }
 
 if (-not $AssetBinRoot) {
@@ -80,34 +97,51 @@ function Get-UrlVariants {
 function Find-UrlInText {
     param(
         [string]$Path,
-        [string[]]$Variants
+        [object[]]$Terms
     )
 
+    $matchedTerms = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
     foreach ($line in [System.IO.File]::ReadLines($Path)) {
-        foreach ($variant in $Variants) {
-            if ($line.IndexOf($variant, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                return 'line'
+        foreach ($term in $Terms) {
+            if ($seen.ContainsKey($term.Value)) {
+                continue
             }
+
+            foreach ($variant in $term.Variants) {
+                if ($line.IndexOf($variant, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $seen[$term.Value] = $true
+                    $matchedTerms.Add($term.Value) | Out-Null
+                    break
+                }
+            }
+        }
+
+        if ($matchedTerms.Count -eq $Terms.Count) {
+            break
         }
     }
 
-    return ''
+    return $matchedTerms.ToArray()
 }
 
 function Get-SearchFiles {
     param(
-        [string]$MhtmlPath,
+        [object[]]$MhtmlPaths,
         [string]$BinPath
     )
 
     $items = New-Object System.Collections.Generic.List[object]
 
-    foreach ($file in @(Get-ChildItem -LiteralPath $MhtmlPath -Filter *.mhtml -File -Recurse | Sort-Object FullName)) {
-        $items.Add([pscustomobject]@{
-            File = $file
-            BasePath = $MhtmlPath
-            Prefix = ''
-        }) | Out-Null
+    foreach ($mhtmlPath in $MhtmlPaths) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $mhtmlPath.Path -Filter *.mhtml -File -Recurse | Sort-Object FullName)) {
+            $items.Add([pscustomobject]@{
+                File = $file
+                BasePath = $mhtmlPath.Path
+                Prefix = $mhtmlPath.Prefix
+            }) | Out-Null
+        }
     }
 
     if (Test-Path -LiteralPath $BinPath) {
@@ -123,13 +157,30 @@ function Get-SearchFiles {
     return $items.ToArray()
 }
 
-if (-not (Test-Path -LiteralPath $MhtmlRoot)) {
-    throw "Folder MHTML tidak ditemukan: $MhtmlRoot"
+$mhtmlSearchRoots = @($defaultMhtmlRoots | Where-Object { Test-Path -LiteralPath $_.Path })
+if ($mhtmlSearchRoots.Count -eq 0) {
+    $missingRoots = (($defaultMhtmlRoots | ForEach-Object { $_.Path }) -join ', ')
+    throw "Folder MHTML tidak ditemukan: $missingRoots"
 }
 
-$variants = @(Get-UrlVariants -Value $Url)
+$searchTerms = @(
+    foreach ($value in $Url) {
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            continue
+        }
+
+        [pscustomobject]@{
+            Value = $value
+            Variants = [string[]]@(Get-UrlVariants -Value $value)
+        }
+    }
+)
+if ($searchTerms.Count -eq 0) {
+    throw 'Minimal satu string pencarian harus diisi.'
+}
+
 $results = New-Object System.Collections.Generic.List[object]
-$files = @(Get-SearchFiles -MhtmlPath $MhtmlRoot -BinPath $AssetBinRoot)
+$files = @(Get-SearchFiles -MhtmlPaths $mhtmlSearchRoots -BinPath $AssetBinRoot)
 $total = $files.Count
 $index = 0
 
@@ -140,8 +191,8 @@ foreach ($item in $files) {
         Write-Host ("Scan {0}/{1}: {2}" -f $index, $total, $file.Name)
     }
 
-    $matchKind = Find-UrlInText -Path $file.FullName -Variants $variants
-    if (-not $matchKind) {
+    $matchedUrls = @(Find-UrlInText -Path $file.FullName -Terms $searchTerms)
+    if ($matchedUrls.Count -eq 0) {
         continue
     }
 
@@ -150,13 +201,15 @@ foreach ($item in $files) {
         $relativePath = $item.Prefix + ($relativePath -replace '\\', '/')
     }
 
-    $results.Add([pscustomobject]@{
-        file = ($relativePath -replace '\\', '/')
-        match_kind = $matchKind
-        url = $Url
-    }) | Out-Null
+    foreach ($matchedUrl in $matchedUrls) {
+        $results.Add([pscustomobject]@{
+            file = ($relativePath -replace '\\', '/')
+            match_kind = 'line'
+            url = $matchedUrl
+        }) | Out-Null
 
-    Write-Host ("MATCH: {0}" -f ($relativePath -replace '\\', '/'))
+        Write-Host ("MATCH: {0} :: {1}" -f ($relativePath -replace '\\', '/'), $matchedUrl)
+    }
 }
 
 $writer = $null
@@ -179,6 +232,7 @@ finally {
 
 Write-Host ''
 Write-Host 'Done.'
+Write-Host "Search  : $($searchTerms.Count)"
 Write-Host "Scanned : $total"
 Write-Host "Matched : $($results.Count)"
 Write-Host "Output  : $OutputPath"
